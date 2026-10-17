@@ -1,0 +1,22 @@
+[project]
+name = "portdb"
+version = "0.1.0"
+description = "Container terminal operating system: PostgreSQL core, SimPy engine, WebSocket diorama feed"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic>=1.13",
+    "fastapi>=0.115",
+    "psycopg[binary,pool]>=3.2",
+    "simpy>=4.1",
+    "sqlalchemy>=2.0.30",
+    "uvicorn[standard]>=0.30",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pgserver>=0.1.4"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

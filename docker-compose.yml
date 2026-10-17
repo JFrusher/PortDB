@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: port
+      POSTGRES_PASSWORD: port
+      POSTGRES_DB: port
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U port -d port"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"   # for psql / DBeaver poking at the live terminal
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://port:port@db:5432/port
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
