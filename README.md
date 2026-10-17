@@ -19,6 +19,7 @@ docker compose up --build     # then open http://localhost:8080
 Most simulations keep the rules in application code and treat the database as a place to write results. PortDB does the opposite. The SimPy engine proposes moves, and Postgres accepts or refuses them:
 
 - A box cannot be stacked on thin air.
+- A 40 ft box cannot sit on 20s. Every stack holds one length, with 20s in fore and aft pairs.
 - A heavy box cannot go on top of a light one aboard ship.
 - A box booked for Hamburg cannot be loaded above one going to Rotterdam.
 - An import cannot leave on a vessel, and a box under customs hold cannot leave at all until it has been scanned.
@@ -149,7 +150,9 @@ SimPy processes are synchronous generators and the database driver is async. The
 
 | Rule | How it's enforced |
 |---|---|
-| One box per yard slot, ship cell and wagon slot | Composite foreign keys + `UNIQUE`, coordinates all-or-nothing via `num_nulls()` |
+| One box per position | Composite foreign keys + `UNIQUE (block, bay, row, tier, half)`: a 40 ft slot holds one 40 (half 0) or two 20s (halves 1 and 2) |
+| One length per stack, never a 40 on a 20 | Deferred trigger; gravity is checked per fore/aft column, so a 20 always sits squarely on a 20 |
+| 60 ft rail wagons | Three 20 ft positions; a 40 takes two adjacent ones, and overlaps are refused at commit |
 | Lifecycle per direction | Transition table `(from, to, flows[])` checked by trigger: imports never load onto a ship, exports never leave by road |
 | No floating boxes, yard or ship | Deferred trigger: every touched stack satisfies `count(*) = max(tier)` at commit |
 | Heavy under light, later port under earlier | Deferred trigger comparing neighbouring cells |
@@ -158,7 +161,7 @@ SimPy processes are synchronous generators and the database driver is async. The
 | Customs | `CHECK (NOT customs_hold OR inspected_at IS NOT NULL OR state NOT IN ('GATE_OUT','ON_RAIL','RAIL_OUT'))` |
 | Real container numbers | `CHECK (iso6346_valid(id))`, the ISO 6346 check digit in PL/pgSQL |
 
-Three hand-written Alembic migrations hold all of it ([`backend/alembic/versions`](backend/alembic/versions)), with SQLAlchemy models kept in step by a test. The full design notes are in [BACKBONE.md](BACKBONE.md).
+Positions print as real bay numbers: 20 ft bays odd (01, 03), the 40 ft bay over them even (02), computed by `bay_code()` in SQL. Four hand-written Alembic migrations hold all of it ([`backend/alembic/versions`](backend/alembic/versions)), with SQLAlchemy models kept in step by a test. The full design notes are in [BACKBONE.md](BACKBONE.md).
 
 ## Run it
 
@@ -173,7 +176,7 @@ docker compose up --build        # web on :8080, Postgres on :5432 (port / port)
 ```bash
 cd backend
 uv sync
-uv run pytest                    # 24 tests against a throwaway Postgres
+uv run pytest                    # 28 tests against a throwaway Postgres
 DATABASE_URL=postgresql://port:port@localhost:5432/port uv run alembic upgrade head
 DATABASE_URL=… uv run python -m portdb.api
 
@@ -186,10 +189,12 @@ The API resets the terminal and restocks the yard on every start, because a half
 
 ## Tests
 
-Twenty-four tests run against a real Postgres. Most try to break a rule and expect a specific error:
+Twenty-eight tests run against a real Postgres. Most try to break a rule and expect a specific error:
 - two boxes in one slot
 - a floating box
 - an import loaded onto a ship
+- a 40 on a pair of 20s, or a 20 with nothing under its half of the slot
+- two boxes overlapping on a 60 ft wagon
 - a heavy box on a light one
 - a Gdansk box over a Rotterdam box
 - an export in an import block
@@ -201,7 +206,7 @@ The last test runs the whole terminal headless for thirteen simulated minutes. I
 
 ## Limits
 
-Twenty-foot boxes take a full cell rather than half of one. Customs never fails a box. Ship stability is only heavy-under-light. Lorries don't overtake on the through lane. The tuning in [`config.py`](backend/portdb/config.py) is chosen to make a port call last minutes rather than days.
+Customs never fails a box. Ship stability is only heavy-under-light. Lorries don't overtake on the through lane. The tuning in [`config.py`](backend/portdb/config.py) is chosen to make a port call last minutes rather than days.
 
 ## Built with
 

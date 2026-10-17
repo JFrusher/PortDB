@@ -14,17 +14,17 @@ PARKED = config.PARKED
 
 CLEARANCE_SQL = """
 WITH RECURSIVE stack AS (
-    SELECT c.id, c.block_code, c.bay, c.row, c.tier, 0 AS depth
+    SELECT c.id, c.block_code, c.bay, c.row, c.tier, c.half, 0 AS depth
     FROM containers c
     WHERE c.id = %(target)s AND c.state IN ('STACKED_IN_YARD', 'RETRIEVING')
   UNION ALL
-    SELECT above.id, above.block_code, above.bay, above.row, above.tier, s.depth + 1
+    SELECT above.id, above.block_code, above.bay, above.row, above.tier, above.half, s.depth + 1
     FROM stack s
     JOIN containers above
-      ON (above.block_code, above.bay, above.row, above.tier)
-       = (s.block_code, s.bay, s.row, s.tier + 1)
+      ON (above.block_code, above.bay, above.row, above.half, above.tier)
+       = (s.block_code, s.bay, s.row, s.half, s.tier + 1)
 )
-SELECT id, block_code, bay, row, tier, depth, depth = 0 AS is_target,
+SELECT id, block_code, bay, row, tier, half, bay_code(bay, half) AS bay_code, depth, depth = 0 AS is_target,
        count(*) FILTER (WHERE depth > 0) OVER () AS shifter_moves
 FROM stack
 ORDER BY tier DESC
@@ -47,7 +47,8 @@ async def choose_block(conn: AsyncConnection, hazmat: bool, purpose: str) -> str
         """
         SELECT b.code
         FROM yard_blocks b
-        LEFT JOIN LATERAL (SELECT count(*) AS n FROM containers c WHERE c.block_code = b.code) occ ON true
+        LEFT JOIN LATERAL (SELECT coalesce(sum(CASE WHEN is_forty(c.iso_type) THEN 1 ELSE 0.5 END), 0) AS n
+                           FROM containers c WHERE c.block_code = b.code) occ ON true
         LEFT JOIN LATERAL (SELECT count(*) AS n FROM equipment_tasks t
                            WHERE t.status IN ('PENDING','IN_PROGRESS') AND t.kind = 'TRANSPORT'
                              AND t.target->>'block' = b.code) inflight ON true
@@ -62,25 +63,30 @@ async def choose_block(conn: AsyncConnection, hazmat: bool, purpose: str) -> str
     return row and row["code"]
 
 
-async def allocate_slot(conn: AsyncConnection, block: str, avoid: tuple[int, int] | None = None) -> dict | None:
-    """First free supported slot, building stacks to tier 3 before using tiers 4-5 (bounds bury depth
-    while still burying boxes, as a real yard does). `avoid` keeps a reshuffled box off its own stack."""
+async def allocate_slot(conn: AsyncConnection, block: str, forty: bool,
+                        avoid: tuple[int, int] | None = None) -> dict | None:
+    """First free supported position for a box of this length: a 40 fills a slot (half 0), 20s pair up
+    fore and aft (halves 1, 2). Only stacks that are empty or already hold this length qualify.
+    Stacks are built to tier 3 before tiers 4-5 are used. `avoid` keeps a re-handled box off its own stack."""
     xbay, xrow = avoid or (None, None)
     return await (await conn.execute(
         """
-        SELECT s.block_code, s.bay, s.row, s.tier
-        FROM yard_slots s
+        SELECT s.block_code, s.bay, s.row, s.tier, h.half
+        FROM yard_slots s CROSS JOIN unnest(%(halves)s::smallint[]) AS h(half)
         WHERE s.block_code = %(block)s
           AND (s.bay, s.row) IS DISTINCT FROM (%(xbay)s::smallint, %(xrow)s::smallint)
           AND NOT EXISTS (SELECT 1 FROM containers c
-                          WHERE (c.block_code, c.bay, c.row, c.tier) = (s.block_code, s.bay, s.row, s.tier))
+                          WHERE (c.block_code, c.bay, c.row) = (s.block_code, s.bay, s.row)
+                            AND is_forty(c.iso_type) <> %(forty)s)
+          AND NOT EXISTS (SELECT 1 FROM containers c
+                          WHERE (c.block_code, c.bay, c.row, c.tier, c.half) = (s.block_code, s.bay, s.row, s.tier, h.half))
           AND (s.tier = 1 OR EXISTS (SELECT 1 FROM containers c
-                          WHERE (c.block_code, c.bay, c.row, c.tier) = (s.block_code, s.bay, s.row, s.tier - 1)))
-        ORDER BY s.tier > 3, s.bay, s.row, s.tier
+                          WHERE (c.block_code, c.bay, c.row, c.tier, c.half) = (s.block_code, s.bay, s.row, s.tier - 1, h.half)))
+        ORDER BY s.tier > 3, s.bay, s.row, s.tier, h.half
         LIMIT 1
         FOR UPDATE OF s SKIP LOCKED
         """,
-        {"block": block, "xbay": xbay, "xrow": xrow},
+        {"block": block, "xbay": xbay, "xrow": xrow, "forty": forty, "halves": [0] if forty else [1, 2]},
     )).fetchone()
 
 
@@ -88,7 +94,7 @@ async def move_to_slot(conn: AsyncConnection, box: str, slot: dict, state: str |
     """state=None keeps the current one: a reshuffled blocker may itself be RETRIEVING for another lorry."""
     await conn.execute(
         """UPDATE containers SET state = coalesce(%(state)s::container_state, state), carrier_id = NULL,
-                  block_code = %(block_code)s, bay = %(bay)s, row = %(row)s, tier = %(tier)s
+                  block_code = %(block_code)s, bay = %(bay)s, row = %(row)s, tier = %(tier)s, half = %(half)s
            WHERE id = %(box)s""",
         {**slot, "box": box, "state": state},
     )
@@ -96,8 +102,9 @@ async def move_to_slot(conn: AsyncConnection, box: str, slot: dict, state: str |
 
 async def yard_fill(conn: AsyncConnection, purpose: str) -> float:
     row = await (await conn.execute(
-        """SELECT count(c.id)::float / (SELECT count(*) FROM yard_slots s JOIN yard_blocks b ON b.code = s.block_code
-                                       WHERE b.purpose = %(p)s) AS f
+        """SELECT coalesce(sum(CASE WHEN is_forty(c.iso_type) THEN 1 ELSE 0.5 END), 0)::float
+                  / (SELECT count(*) FROM yard_slots s JOIN yard_blocks b ON b.code = s.block_code
+                     WHERE b.purpose = %(p)s) AS f
            FROM containers c JOIN yard_blocks b ON b.code = c.block_code WHERE b.purpose = %(p)s""",
         {"p": purpose})).fetchone()
     return row["f"]
@@ -115,12 +122,13 @@ async def claim_next_box(conn: AsyncConnection, vessel_id: int, bay_lo: int, bay
           SELECT c.id FROM containers c
           WHERE c.vessel_id = %(v)s AND c.state = 'STOWED_ON_BOARD' AND c.vessel_bay BETWEEN %(lo)s AND %(hi)s
             AND NOT EXISTS (SELECT 1 FROM containers a
-                            WHERE (a.vessel_id, a.vessel_bay, a.vessel_row) = (c.vessel_id, c.vessel_bay, c.vessel_row)
+                            WHERE (a.vessel_id, a.vessel_bay, a.vessel_row, a.vessel_half)
+                                = (c.vessel_id, c.vessel_bay, c.vessel_row, c.vessel_half)
                               AND a.vessel_tier > c.vessel_tier)
-          ORDER BY c.vessel_tier DESC, c.vessel_bay, c.vessel_row
+          ORDER BY c.vessel_tier DESC, c.vessel_bay, c.vessel_row, c.vessel_half
           LIMIT 1
           FOR UPDATE OF c SKIP LOCKED)
-        RETURNING id, iso_type, hazmat, weight_kg, flow, vessel_bay, vessel_row, vessel_tier
+        RETURNING id, iso_type, hazmat, weight_kg, flow, vessel_bay, vessel_row, vessel_tier, vessel_half
         """,
         {"v": vessel_id, "lo": bay_lo, "hi": bay_hi},
     )).fetchone()
@@ -132,15 +140,17 @@ async def peek_next_bay(conn: AsyncConnection, vessel_id: int, bay_lo: int, bay_
         """SELECT c.vessel_bay FROM containers c
            WHERE c.vessel_id = %(v)s AND c.state = 'STOWED_ON_BOARD' AND c.vessel_bay BETWEEN %(lo)s AND %(hi)s
              AND NOT EXISTS (SELECT 1 FROM containers a
-                             WHERE (a.vessel_id, a.vessel_bay, a.vessel_row) = (c.vessel_id, c.vessel_bay, c.vessel_row)
+                             WHERE (a.vessel_id, a.vessel_bay, a.vessel_row, a.vessel_half)
+                                 = (c.vessel_id, c.vessel_bay, c.vessel_row, c.vessel_half)
                                AND a.vessel_tier > c.vessel_tier)
-           ORDER BY c.vessel_tier DESC, c.vessel_bay, c.vessel_row
+           ORDER BY c.vessel_tier DESC, c.vessel_bay, c.vessel_row, c.vessel_half
            LIMIT 1""",
         {"v": vessel_id, "lo": bay_lo, "hi": bay_hi})).fetchone()
     return row and row["vessel_bay"]
 
 
-async def pick_export(conn: AsyncConnection, below_kg: int | None, below_rotation: int | None) -> dict | None:
+async def pick_export(conn: AsyncConnection, below_kg: int | None, below_rotation: int | None,
+                      forty: bool | None = None) -> dict | None:
     """Load planner: the next box for a cell must not out-weigh, or out-travel, the box beneath it.
     Greedy: latest port first, then heaviest, then fewest boxes to dig through. Keeps the most
     options open for the cells above."""
@@ -151,26 +161,28 @@ async def pick_export(conn: AsyncConnection, below_kg: int | None, below_rotatio
           SELECT c.id FROM containers c JOIN ports p ON p.code = c.pod
           WHERE c.state = 'STACKED_IN_YARD' AND c.mode = 'VESSEL'
             AND (%(kg)s::int IS NULL OR (c.weight_kg <= %(kg)s AND p.rotation <= %(rot)s))
+            AND (%(forty)s::boolean IS NULL OR is_forty(c.iso_type) = %(forty)s)
           ORDER BY p.rotation DESC, c.weight_kg DESC,
                    (SELECT count(*) FROM containers a
-                    WHERE (a.block_code, a.bay, a.row) = (c.block_code, c.bay, c.row) AND a.tier > c.tier),
+                    WHERE (a.block_code, a.bay, a.row, a.half) = (c.block_code, c.bay, c.row, c.half) AND a.tier > c.tier),
                    c.id
           LIMIT 1
           FOR UPDATE OF c SKIP LOCKED)
         RETURNING id, block_code, weight_kg, pod, iso_type, hazmat,
                   (SELECT rotation FROM ports WHERE code = pod) AS rotation
         """,
-        {"kg": below_kg, "rot": below_rotation},
+        {"kg": below_kg, "rot": below_rotation, "forty": forty},
     )).fetchone()
 
 
-async def load_on_vessel(conn: AsyncConnection, box: str, vessel: int, bay: int, row: int, tier: int) -> None:
-    """Spreader has the box over its cell: stowage and gravity triggers judge it at commit."""
+async def load_on_vessel(conn: AsyncConnection, box: str, vessel: int, bay: int, row: int, tier: int,
+                         half: int) -> None:
+    """Spreader has the box over its cell: stowage, gravity and length rules judge it at commit."""
     await conn.execute(
         """UPDATE containers SET state = 'LOADING', carrier_id = NULL,
-                  vessel_id = %s, vessel_bay = %s, vessel_row = %s, vessel_tier = %s
+                  vessel_id = %s, vessel_bay = %s, vessel_row = %s, vessel_tier = %s, vessel_half = %s
            WHERE id = %s""",
-        (vessel, bay, row, tier, box),
+        (vessel, bay, row, tier, half, box),
     )
 
 
@@ -319,8 +331,8 @@ async def load_on_agv(conn: AsyncConnection, box: str, agv: str) -> None:
     """From a ship cell (discharge), a yard slot (rail / vessel transfer) or a wagon (rail-in) onto an AGV."""
     await conn.execute(
         """UPDATE containers SET state = 'IN_TRANSIT', carrier_id = %s,
-                  vessel_bay = NULL, vessel_row = NULL, vessel_tier = NULL,
-                  block_code = NULL, bay = NULL, row = NULL, tier = NULL,
+                  vessel_bay = NULL, vessel_row = NULL, vessel_tier = NULL, vessel_half = NULL,
+                  block_code = NULL, bay = NULL, row = NULL, tier = NULL, half = NULL,
                   train_id = NULL, wagon = NULL, wagon_slot = NULL
            WHERE id = %s""",
         (agv, box),
@@ -329,7 +341,8 @@ async def load_on_agv(conn: AsyncConnection, box: str, agv: str) -> None:
 
 async def load_on_truck(conn: AsyncConnection, box: str) -> None:
     await conn.execute(
-        "UPDATE containers SET state = 'ON_TRUCK', block_code = NULL, bay = NULL, row = NULL, tier = NULL WHERE id = %s",
+        "UPDATE containers SET state = 'ON_TRUCK', block_code = NULL, bay = NULL, row = NULL, tier = NULL, half = NULL "
+        "WHERE id = %s",
         (box,),
     )
 
@@ -370,7 +383,7 @@ async def depart_train(conn: AsyncConnection, train: int) -> list[str]:
     return [r["id"] for r in rows]
 
 
-async def pick_rail_box(conn: AsyncConnection) -> dict | None:
+async def pick_rail_box(conn: AsyncConnection, forty: bool | None = None) -> dict | None:
     """Rail planner: the rail-booked box with the fewest boxes on top of it, so trains rarely wait on digs."""
     return await (await conn.execute(
         """
@@ -378,13 +391,14 @@ async def pick_rail_box(conn: AsyncConnection) -> dict | None:
         WHERE id = (
           SELECT c.id FROM containers c
           WHERE c.state = 'STACKED_IN_YARD' AND c.mode = 'RAIL'
+            AND (%(forty)s::boolean IS NULL OR is_forty(c.iso_type) = %(forty)s)
           ORDER BY (SELECT count(*) FROM containers a
-                    WHERE (a.block_code, a.bay, a.row) = (c.block_code, c.bay, c.row) AND a.tier > c.tier),
+                    WHERE (a.block_code, a.bay, a.row, a.half) = (c.block_code, c.bay, c.row, c.half) AND a.tier > c.tier),
                    c.id
           LIMIT 1
           FOR UPDATE OF c SKIP LOCKED)
-        RETURNING id, block_code, customs_hold
-        """
+        RETURNING id, block_code, customs_hold, iso_type
+        """, {"forty": forty}
     )).fetchone()
 
 
@@ -475,7 +489,7 @@ async def get_container(conn: AsyncConnection, box: str) -> dict | None:
     return await (await conn.execute(
         """SELECT c.id, c.iso_type, c.hazmat, c.weight_kg, c.state, c.flow, c.mode, c.pod, c.customs_hold,
                   c.inspected_at IS NOT NULL AS inspected, c.vessel_id, c.vessel_bay, c.vessel_row, c.vessel_tier,
-                  c.block_code, c.bay, c.row, c.tier, c.carrier_id, c.train_id, c.wagon, c.wagon_slot,
+                  c.vessel_half, c.block_code, c.bay, c.row, c.tier, c.half, c.carrier_id, c.train_id, c.wagon, c.wagon_slot,
                   v.name AS vessel_name, t.name AS train_name
            FROM containers c
            LEFT JOIN vessels v ON v.id = c.vessel_id
@@ -487,6 +501,6 @@ async def live_containers(conn: AsyncConnection) -> list[dict]:
     return await (await conn.execute(
         """SELECT id, iso_type, hazmat, weight_kg, state, flow, mode, pod, customs_hold,
                   inspected_at IS NOT NULL AS inspected,
-                  vessel_id, vessel_bay, vessel_row, vessel_tier, block_code, bay, row, tier, carrier_id,
-                  train_id, wagon, wagon_slot
+                  vessel_id, vessel_bay, vessel_row, vessel_tier, vessel_half, block_code, bay, row, tier, half,
+                  carrier_id, train_id, wagon, wagon_slot
            FROM containers WHERE state NOT IN ('GATE_OUT', 'RAIL_OUT', 'SAILED') ORDER BY id""")).fetchall()

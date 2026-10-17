@@ -20,7 +20,7 @@ BERTHS = {
     3: ("Berth 3", 10, 6, 10, 100),
 }
 FIRST_CALL_S = {1: 0.0, 2: 25.0, 3: 50.0}         # staggered first arrivals
-SHARE_40FT, SHARE_REEFER, SHARE_HAZMAT = 0.40, 0.10, 0.06
+SHARE_40FT, SHARE_REEFER, SHARE_HAZMAT = 0.65, 0.10, 0.06   # by box count; the 20 ft share keeps falling
 SHARE_RAIL, SHARE_CUSTOMS_HOLD = 0.35, 0.12       # of imports: onward by train / flagged for X-ray
 SHARE_TRANSHIP = 0.15                             # of a manifest: stays in the terminal for another ship
 # ports the service calls after leaving here, in rotation order (later port = stowed lower)
@@ -36,7 +36,7 @@ LOAD_PREFETCH = 3                                 # export boxes an AGV may be f
 LOAD_WINDOW_S = 360.0                             # a vessel sails when nothing more fits or this runs out
 AGV_NODES_PER_S = 4.0
 RTG_MOVE_S = 2.5                                  # per box handled: stack, reshuffle hop or truck/AGV load
-LORRY_MEAN_GAP_S = {"IMPORT": 6.5, "EXPORT": 13.0}  # two Poisson streams: pick-ups and drop-offs
+LORRY_MEAN_GAP_S = {"IMPORT": 8.0, "EXPORT": 15.0}  # two Poisson streams: pick-ups and drop-offs
 LORRY_SPEED = 4.0                                 # cells per second on the truck lanes
 GATE_CHECKIN_S = 1.5
 GATE_CHECKOUT_S = 1.0
@@ -45,7 +45,7 @@ VESSEL_SAIL_S = 10.0
 NEXT_VESSEL_GAP_S = 8.0
 NEXT_VESSEL_YARD_MAX = 0.75                      # a berth takes its next ship once import stacks drop below this
 
-TRAIN_WAGONS = 10                                 # 2 box slots per flat wagon
+TRAIN_WAGONS = 10                                 # 60 ft platforms: three 20 ft positions, a 40 takes two
 TRAIN_INBOUND = 12                               # export boxes a train brings in
 FIRST_TRAIN_S = 40.0
 TRAIN_WINDOW_S = 200.0

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { C, useDetail, useQuality } from "./models";
 import { FOCUS } from "./scene";
-import { changed, fmtClock, fmtSlot, post, useWorld, world, type Box, type Focus } from "./world";
+import { bayCode, changed, fmtClock, fmtSlot, post, useWorld, world, type Box, type Focus } from "./world";
 
 const SPEEDS = [0.5, 1, 2, 4, 8];
 const PORTS: [string, string][] = [["NLRTM", "Rotterdam"], ["DEHAM", "Hamburg"], ["PLGDN", "Gdansk"]];
@@ -218,7 +218,10 @@ function Inspector({ id, onPick }: { id: string | null; onPick: (id: string | nu
         ? `${found?.train_name ?? world.train?.name ?? "train"} wagon ${box.wagon}/${box.wagon_slot}`
         : box.state === "SAILED"
           ? `sailed on ${found?.vessel_name ?? "a ship"} for ${box.pod}`
-          : (box.carrier_id ?? (box.vessel_bay ? `${vessel?.name ?? "ship"} ${box.vessel_bay}-${box.vessel_row}-${box.vessel_tier}` : ""));
+          : (box.carrier_id ??
+              (box.vessel_bay
+                ? `${vessel?.name ?? "ship"} bay ${bayCode(box.vessel_bay, box.vessel_half)} row ${box.vessel_row} tier ${box.vessel_tier}`
+                : ""));
 
   // re-query clearance when the box lands somewhere new (the box object itself changes on every event)
   useEffect(() => {
@@ -264,7 +267,7 @@ function Inspector({ id, onPick }: { id: string | null; onPick: (id: string | nu
             <dd>{box.flow}</dd>
             <dt>type</dt>
             <dd>
-              {box.iso_type}
+              {box.iso_type.startsWith("4") ? "40 ft" : "20 ft"} · {box.iso_type}
               {box.hazmat ? " · IMDG" : ""}
             </dd>
             <dt>gross</dt>

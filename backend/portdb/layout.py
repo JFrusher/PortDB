@@ -29,7 +29,8 @@ QC_SPUR_Z, BLOCK_SPUR_Z = 1, 4
 LANE_ZS = (2, 3)
 LOAD_Z, THRU_Z = 10, 11
 RAIL_LANE_Z, RAIL_SPUR_Z, RAIL_Z = 13, 14, 15
-RAIL_X0 = 7                                      # stopped train: wagon w, slot s at x = RAIL_X0 + 2(w-1) + s
+RAIL_X0 = 7                                      # stopped train: wagon w centred at x = RAIL_X0 + 2(w-1) + 1
+TEU = 0.5                                        # a 20 ft box is half a 40 ft position
 TRAIN_FROM_X, TRAIN_TO_X = -70, 110
 LORRY_SPAWN_X, QUEUE_HEAD_X, GATE_IN_X = -34, -9, -7
 SCAN_ROAD_X, GATE_OUT_X, LORRY_EXIT_X = 58, 64, 86
@@ -54,20 +55,26 @@ Node = tuple[int, int]
 Point = tuple[float, float, float]
 
 
-def ship_cell(berth: int, bay: int, row: int, tier: int) -> Point:
-    return (BERTH_X0[berth] + bay, SHIP_DECK + (tier - 1) * BOX_H, -row - 0.5)
+def half_dx(half: int) -> float:
+    """A 40 ft position holds one 40 (half 0) or two 20s, fore (1) and aft (2)."""
+    return (0.0, -TEU / 2, TEU / 2)[half]
 
 
-def slot(block: str, bay: int, row: int, tier: int) -> Point:
-    return (BLOCK_X0[block] + bay, (tier - 1) * BOX_H, BLOCK_Z0 + row)
+def ship_cell(berth: int, bay: int, row: int, tier: int, half: int = 0) -> Point:
+    return (BERTH_X0[berth] + bay + half_dx(half), SHIP_DECK + (tier - 1) * BOX_H, -row - 0.5)
 
 
-def wagon_x(wagon: int, wagon_slot: int) -> int:
-    return RAIL_X0 + 2 * (wagon - 1) + wagon_slot
+def slot(block: str, bay: int, row: int, tier: int, half: int = 0) -> Point:
+    return (BLOCK_X0[block] + bay + half_dx(half), (tier - 1) * BOX_H, BLOCK_Z0 + row)
 
 
-def wagon_slot_point(wagon: int, wagon_slot: int) -> Point:
-    return (wagon_x(wagon, wagon_slot), WAGON_BED_Y, RAIL_Z)
+def wagon_x(wagon: int) -> int:
+    return RAIL_X0 + 2 * (wagon - 1) + 1
+
+
+def wagon_slot_point(wagon: int, wagon_slot: int, forty: bool) -> Point:
+    """Positions 1..3 are 20 ft each along the wagon; a 40 centres on its two."""
+    return (wagon_x(wagon) + (wagon_slot - (1.5 if forty else 2)) * TEU, WAGON_BED_Y, RAIL_Z)
 
 
 def qc_spur(berth: int, bay: int) -> Node:
@@ -78,8 +85,8 @@ def block_spurs(block: str) -> list[Node]:
     return [(BLOCK_X0[block] + b, BLOCK_SPUR_Z) for b in range(1, config.BLOCK_BAYS + 1)]
 
 
-def rail_spur(wagon: int, wagon_slot: int) -> Node:
-    return (wagon_x(wagon, wagon_slot), RAIL_SPUR_Z)
+def rail_spur(wagon: int) -> Node:
+    return (wagon_x(wagon), RAIL_SPUR_Z)
 
 
 def lorry_spot(block: str, bay: int) -> Node:
@@ -97,7 +104,7 @@ def lifted(p: Point, y: float) -> Point:
 # --- AGV road graph: explicit edges, so spurs are dead ends ---------------------------------
 QC_SPURS = {qc_spur(b, bay) for b, (_, bays, *_rest) in config.BERTHS.items() for bay in range(1, bays + 1)}
 BLOCK_SPURS = {n for b in BLOCK_X0 for n in block_spurs(b)}
-RAIL_SPURS = {rail_spur(w, s) for w in range(1, config.TRAIN_WAGONS + 1) for s in (1, 2)}
+RAIL_SPURS = {rail_spur(w) for w in range(1, config.TRAIN_WAGONS + 1)}
 SPURS = QC_SPURS | BLOCK_SPURS | RAIL_SPURS | set(PARKS)
 
 EDGES: dict[Node, set[Node]] = {}
@@ -184,12 +191,12 @@ def rmg_wagons() -> dict[str, list[int]]:
 
 
 def rmg_homes() -> list[float]:
-    return [wagon_x(ws[len(ws) // 2], 1) for ws in rmg_wagons().values()]
+    return [wagon_x(ws[len(ws) // 2]) for ws in rmg_wagons().values()]
 
 
 def payload() -> dict:
     return {
-        "box_h": BOX_H, "ship_deck": SHIP_DECK,
+        "box_h": BOX_H, "ship_deck": SHIP_DECK, "teu": TEU,
         "agv_bed_y": AGV_BED_Y, "lorry_bed_y": LORRY_BED_Y, "wagon_bed_y": WAGON_BED_Y,
         "berths": [{"id": b, "name": name, "x0": BERTH_X0[b], "bays": bays, "rows": rows, "tiers": tiers}
                    for b, (name, bays, rows, tiers, _) in config.BERTHS.items()],

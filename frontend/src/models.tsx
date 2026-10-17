@@ -170,17 +170,20 @@ export function Lorry({ id }: { id: string }) {
 function trainGeo(L: Layout) {
   const body = new Parts();
   const detail = new Parts();
+  // 60 ft platforms: three 20 ft positions each, a 40 spans two
   for (let w = 1; w <= L.rail.wagons; w++) {
-    const cx = 2 * w - 0.5;
-    body.box([1.9, 0.1, 0.5], [cx, L.wagon_bed_y - 0.05, 0], "#7D6B5D").box([1.6, 0.1, 0.18], [cx, L.wagon_bed_y - 0.15, 0], C.steel);
-    for (const x of [-0.65, 0.65]) {
+    const cx = 2 * w - 1;
+    const half = 1.5 * L.teu + 0.05;
+    body.box([2 * half, 0.1, 0.5], [cx, L.wagon_bed_y - 0.05, 0], "#7D6B5D").box([2 * half - 0.2, 0.1, 0.18], [cx, L.wagon_bed_y - 0.15, 0], C.steel);
+    for (const x of [-half + 0.22, half - 0.22]) {
       body.box([0.36, 0.1, 0.4], [cx + x, 0.14, 0], C.tyre);
       for (const dx of [-0.1, 0.1]) for (const z of [-0.2, 0.2]) body.cyl(0.07, 0.04, [cx + x + dx, 0.1, z], C.tyre, "z", 10);
     }
-    for (const x of [-0.92, 0.92]) for (const z of [-0.22, 0.22]) detail.box([0.03, 0.12, 0.03], [cx + x, L.wagon_bed_y + 0.06, z], C.steel);
-    detail.box([0.12, 0.05, 0.06], [cx + 1.0, 0.3, 0], C.steel);
+    // container pins at every 20 ft position boundary
+    for (let k = 0; k <= 3; k++) for (const z of [-0.2, 0.2]) detail.box([0.03, 0.04, 0.03], [cx + (k - 1.5) * L.teu, L.wagon_bed_y + 0.02, z], C.amber);
+    detail.box([0.12, 0.05, 0.06], [cx + half + 0.12, 0.3, 0], C.steel);
   }
-  const lx = 2 * L.rail.wagons + 2;
+  const lx = 2 * L.rail.wagons + 1.5;
   body.box([2.0, 0.56, 0.52], [lx - 0.2, 0.62, 0], C.boot).box([0.5, 0.76, 0.56], [lx + 0.85, 0.72, 0], C.ivory)
     .box([1.2, 0.08, 0.4], [lx + 0.2, 0.93, 0], C.steel).box([2.4, 0.08, 0.5], [lx - 0.3, 0.32, 0], C.steel);
   for (const x of [-1.0, 0.5]) body.box([0.6, 0.12, 0.42], [lx + x, 0.14, 0], C.tyre);

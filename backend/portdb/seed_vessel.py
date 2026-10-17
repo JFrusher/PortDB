@@ -53,9 +53,13 @@ def rail_span(x: float, half: float) -> Range:
     return Range(Decimal(str(round(x - half, 3))), Decimal(str(round(x + half, 3))))
 
 
-def cargo(rng: random.Random, flow: str, hazmat_ok: bool = True) -> dict:
+def is_forty(box: dict) -> bool:
+    return box["iso_type"].startswith("4")
+
+
+def cargo(rng: random.Random, flow: str, hazmat_ok: bool = True, forty: bool | None = None) -> dict:
     """One box's commercial details. Imports carry an onward mode; exports and tranships a port of discharge."""
-    forty = rng.random() < config.SHARE_40FT
+    forty = rng.random() < config.SHARE_40FT if forty is None else forty
     reefer = rng.random() < config.SHARE_REEFER
     box = {
         "id": new_id(rng),
@@ -73,8 +77,8 @@ def cargo(rng: random.Random, flow: str, hazmat_ok: bool = True) -> dict:
 
 
 COLS = ["id", "iso_type", "weight_kg", "hazmat", "flow", "mode", "customs_hold", "pod", "state",
-        "vessel_id", "vessel_bay", "vessel_row", "vessel_tier", "block_code", "bay", "row", "tier",
-        "train_id", "wagon", "wagon_slot"]
+        "vessel_id", "vessel_bay", "vessel_row", "vessel_tier", "vessel_half", "block_code", "bay", "row", "tier",
+        "half", "train_id", "wagon", "wagon_slot"]
 
 
 async def insert_boxes(conn: AsyncConnection, boxes: list[dict]) -> None:
@@ -85,27 +89,43 @@ async def insert_boxes(conn: AsyncConnection, boxes: list[dict]) -> None:
         )
 
 
+def split_stacks(stacks: list, n_forty: int, n_twenty: int) -> tuple[list, list]:
+    """Share stacks between lengths in proportion to the TEU each needs: one length per stack."""
+    teu40, teu20 = 2 * n_forty, n_twenty
+    k = round(len(stacks) * teu40 / max(teu40 + teu20, 1))
+    k = min(max(k, 1 if n_forty else 0), len(stacks) - (1 if n_twenty else 0))
+    return stacks[:k], stacks[k:]
+
+
 def manifest(vessel_id: int, berth: int, rng: random.Random) -> list[dict]:
-    """Imports + a share of tranships, stowed bottom-up, heaviest lowest; tranship ports latest-lowest."""
+    """Imports + a share of tranships. 40s and pairs of 20s get stacks of their own; each column is
+    stowed bottom-up, heaviest lowest, tranship ports latest-lowest."""
     _, bays, rows, tiers, load = config.BERTHS[berth]
     stacks = [(b, r) for b in range(1, bays + 1) for r in range(1, rows + 1)]
-    heights = dict.fromkeys(stacks, 0)
-    for _ in range(load):
-        heights[rng.choice([s for s in stacks if heights[s] < tiers])] += 1
+    rng.shuffle(stacks)
+    boxes = [cargo(rng, "TRANSHIP" if rng.random() < config.SHARE_TRANSHIP else "IMPORT") for _ in range(load)]
+    fortys = [b for b in boxes if is_forty(b)]
+    twentys = [b for b in boxes if not is_forty(b)]
+    s40, s20 = split_stacks(stacks, len(fortys), len(twentys))
+    columns: dict[tuple, list] = {}
+    for group, cols in ((fortys, [(b, r, 0) for b, r in s40]), (twentys, [(b, r, h) for b, r in s20 for h in (1, 2)])):
+        for box in group:
+            open_ = [c for c in cols if len(columns.get(c, [])) < tiers]
+            if open_:
+                columns.setdefault(rng.choice(open_), []).append(box)
 
-    boxes = []
-    for (bay, row), height in heights.items():
-        column = sorted((cargo(rng, "TRANSHIP" if rng.random() < config.SHARE_TRANSHIP else "IMPORT")
-                         for _ in range(height)), key=lambda c: -c["weight_kg"])
+    out = []
+    for (bay, row, half), column in columns.items():
+        column.sort(key=lambda c: -c["weight_kg"])
         # stowage rule: a later port never sits on an earlier one, so hand the ports out latest-first
         pods = sorted((c["pod"] for c in column if c["pod"]), key=lambda p: -PORT_RANK[p])
         for tier, box in enumerate(column, start=1):
             if box["pod"]:
                 box["pod"] = pods.pop(0)
             box |= {"state": "STOWED_ON_BOARD", "vessel_id": vessel_id,
-                    "vessel_bay": bay, "vessel_row": row, "vessel_tier": tier}
-        boxes += column
-    return boxes
+                    "vessel_bay": bay, "vessel_row": row, "vessel_tier": tier, "vessel_half": half}
+        out += column
+    return out
 
 
 async def reset(conn: AsyncConnection) -> None:
@@ -147,15 +167,22 @@ async def reset(conn: AsyncConnection) -> None:
 
 
 async def seed_yard(conn: AsyncConnection, rng: random.Random) -> int:
-    """Yard inventory at shift start, stacks built to tier 3 as the allocator would have left them."""
+    """Yard inventory at shift start: stacks of one length, built to tier 3 as the allocator would."""
     boxes = []
+    share = 2 * config.SHARE_40FT / (2 * config.SHARE_40FT + 1 - config.SHARE_40FT)   # 40 ft share of TEU
     for block, (purpose, allows_hazmat) in config.BLOCKS.items():
         stacks = [(bay, row) for bay in range(1, config.BLOCK_BAYS + 1) for row in range(1, config.BLOCK_ROWS + 1)]
-        for n in range(config.YARD_PRESTOCK[purpose]):
-            bay, row = stacks[n // 3]
-            box = cargo(rng, purpose, hazmat_ok=allows_hazmat)
-            boxes.append(box | {"state": "STACKED_IN_YARD", "block_code": block, "bay": bay, "row": row,
-                                "tier": n % 3 + 1})
+        placed = 0
+        for bay, row in stacks:
+            if placed >= config.YARD_PRESTOCK[purpose]:
+                break
+            forty = rng.random() < share
+            for tier in (1, 2, 3):
+                for half in ((0,) if forty else (1, 2)):
+                    box = cargo(rng, purpose, hazmat_ok=allows_hazmat, forty=forty)
+                    boxes.append(box | {"state": "STACKED_IN_YARD", "block_code": block, "bay": bay, "row": row,
+                                        "tier": tier, "half": half})
+                    placed += 1
     await insert_boxes(conn, boxes)
     return len(boxes)
 
@@ -183,10 +210,15 @@ async def new_export_on_truck(conn: AsyncConnection, rng: random.Random, plate: 
 
 
 async def new_inbound_rail(conn: AsyncConnection, rng: random.Random, train: int) -> list[dict]:
-    """Export boxes arriving on a train: first slots of every wagon, then second slots."""
-    slots = [(w, s) for s in (1, 2) for w in range(1, config.TRAIN_WAGONS + 1)][:config.TRAIN_INBOUND]
-    boxes = [cargo(rng, "EXPORT") | {"state": "ON_RAIL", "train_id": train, "wagon": w, "wagon_slot": s}
-             for w, s in slots]
+    """Export boxes arriving on a train, packed the way 60 ft wagons are: 40 + 20, or three 20s."""
+    boxes = []
+    for w in range(1, config.TRAIN_WAGONS + 1):
+        pattern = rng.choices([((1, True), (3, False)), ((1, False), (2, True)), ((1, False), (2, False), (3, False))],
+                              weights=[2, 1, 1])[0]
+        for pos, forty in pattern:
+            if len(boxes) < config.TRAIN_INBOUND:
+                boxes.append(cargo(rng, "EXPORT", forty=forty) | {"state": "ON_RAIL", "train_id": train,
+                                                                 "wagon": w, "wagon_slot": pos})
     await insert_boxes(conn, boxes)
     return boxes
 

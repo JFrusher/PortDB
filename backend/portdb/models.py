@@ -147,6 +147,8 @@ class Container(Base):
     bay: Mapped[int | None] = mapped_column(SmallInteger)
     row: Mapped[int | None] = mapped_column(SmallInteger)
     tier: Mapped[int | None] = mapped_column(SmallInteger)
+    half: Mapped[int | None] = mapped_column(SmallInteger)            # 0 = 40 ft, 1 fore / 2 aft 20 ft
+    vessel_half: Mapped[int | None] = mapped_column(SmallInteger)
     carrier_id: Mapped[str | None] = mapped_column(Text, ForeignKey("equipment.id"))
     mode: Mapped[str] = mapped_column(OutboundMode, server_default=text("'TRUCK'"))
     customs_hold: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
@@ -163,8 +165,8 @@ class Container(Base):
             ["yard_slots.block_code", "yard_slots.bay", "yard_slots.row", "yard_slots.tier"],
             name="containers_slot_fk",
         ),
-        UniqueConstraint("block_code", "bay", "row", "tier", name="containers_one_per_slot"),
-        UniqueConstraint("vessel_id", "vessel_bay", "vessel_row", "vessel_tier", name="containers_one_per_cell"),
+        UniqueConstraint("block_code", "bay", "row", "tier", "half", name="containers_one_per_slot"),
+        UniqueConstraint("vessel_id", "vessel_bay", "vessel_row", "vessel_tier", "vessel_half", name="containers_one_per_cell"),
         Index("containers_on_board", "vessel_id", "vessel_bay", text("vessel_tier DESC"),
               postgresql_where=text("state = 'STOWED_ON_BOARD'")),
         UniqueConstraint("train_id", "wagon", "wagon_slot", name="containers_one_per_wagon_slot"),

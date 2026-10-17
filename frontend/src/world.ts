@@ -21,10 +21,12 @@ export type Box = {
   vessel_bay?: number | null;
   vessel_row?: number | null;
   vessel_tier?: number | null;
+  vessel_half?: number | null;
   block_code?: string | null;
   bay?: number | null;
   row?: number | null;
   tier?: number | null;
+  half?: number | null;
   carrier_id?: string | null;
   train_id?: number | null;
   wagon?: number | null;
@@ -34,6 +36,7 @@ export type Block = { code: string; x0: number; z0: number; bays: number; rows: 
 export type Berth = { id: number; name: string; x0: number; bays: number; rows: number; tiers: number };
 export type Layout = {
   box_h: number;
+  teu: number;
   ship_deck: number;
   agv_bed_y: number;
   lorry_bed_y: number;
@@ -203,14 +206,23 @@ export function berthOf(L: Layout, id: number): Berth {
   return L.berths.find((b) => b.id === id)!;
 }
 
-export function shipCell(L: Layout, berth: number, bay: number, row: number, tier: number): V3 {
-  return [berthOf(L, berth).x0 + bay, L.ship_deck + (tier - 1) * L.box_h, -row - 0.5];
+/** A 40 ft position holds one 40 (half 0) or two 20s, fore (1) and aft (2). */
+const halfDx = (L: Layout, half: number | null | undefined) => (half === 1 ? -L.teu / 2 : half === 2 ? L.teu / 2 : 0);
+
+export function shipCell(L: Layout, berth: number, bay: number, row: number, tier: number, half = 0): V3 {
+  return [berthOf(L, berth).x0 + bay + halfDx(L, half), L.ship_deck + (tier - 1) * L.box_h, -row - 0.5];
 }
 
-export function slotPos(L: Layout, block: string, bay: number, row: number, tier: number): V3 {
+export function slotPos(L: Layout, block: string, bay: number, row: number, tier: number, half = 0): V3 {
   const b = L.blocks.find((x) => x.code === block)!;
-  return [b.x0 + bay, (tier - 1) * L.box_h, b.z0 + row];
+  return [b.x0 + bay + halfDx(L, half), (tier - 1) * L.box_h, b.z0 + row];
 }
+
+export const isForty = (b: { iso_type: string }) => b.iso_type.startsWith("4");
+
+/** ISO bay number: 20 ft bays are odd (01, 03), the 40 ft bay spanning them even (02). */
+export const bayCode = (bay: number, half: number | null | undefined) =>
+  String(4 * bay - (half === 1 ? 3 : half === 2 ? 1 : 2)).padStart(2, "0");
 
 /** x offset of a vessel from its berth (null when it should not be drawn). */
 export function shipOffset(L: Layout, v: Vessel | undefined, now: number): number | null {
@@ -223,7 +235,7 @@ export function shipOffset(L: Layout, v: Vessel | undefined, now: number): numbe
   return 0;
 }
 
-/** Reference point of a train: wagon w slot s sits at x + 2(w-1) + s. */
+/** Reference point of a train: 60 ft wagon w is centred at x + 2w - 1, its three 20 ft positions 0.5 apart. */
 export function trainAt(L: Layout, trainId: number, now: number, out: V3): V3 {
   const tr = world.tracks.get(`TRAIN-${trainId}`);
   if (tr) return trackAt(tr, now, out);
@@ -249,7 +261,7 @@ export function boxPos(L: Layout, b: Box, now: number, out: V3): V3 | null {
   }
   if (b.state === "ON_RAIL" && b.train_id != null) {
     trainAt(L, b.train_id, now, tmpT);
-    out[0] = tmpT[0] + 2 * (b.wagon! - 1) + b.wagon_slot!;
+    out[0] = tmpT[0] + 2 * b.wagon! - 1 + (b.wagon_slot! - (isForty(b) ? 1.5 : 2)) * L.teu;
     out[1] = L.wagon_bed_y;
     out[2] = tmpT[2];
     return out;
@@ -258,17 +270,18 @@ export function boxPos(L: Layout, b: Box, now: number, out: V3): V3 | null {
     const v = world.vessels.get(b.vessel_id);
     const dx = shipOffset(L, v, now);
     if (dx == null || !v) return null;
-    Object.assign(out, shipCell(L, v.berth, b.vessel_bay, b.vessel_row!, b.vessel_tier!));
+    Object.assign(out, shipCell(L, v.berth, b.vessel_bay, b.vessel_row!, b.vessel_tier!, b.vessel_half ?? 0));
     out[0] += dx;
     return out;
   }
   if (own) return trackAt(own, now, out); // resting where its last crane move left it
-  if (b.block_code && b.bay != null) return Object.assign(out, slotPos(L, b.block_code, b.bay!, b.row!, b.tier!));
+  if (b.block_code && b.bay != null) return Object.assign(out, slotPos(L, b.block_code, b.bay!, b.row!, b.tier!, b.half ?? 0));
   return null;
 }
 
-export const fmtSlot = (b: { block_code?: string | null; bay?: number | null; row?: number | null; tier?: number | null }) =>
-  `${b.block_code}-${String(b.bay).padStart(2, "0")}-${String(b.row).padStart(2, "0")}-${b.tier}`;
+/** Yard position as block-bay-row-tier, with the ISO bay number (odd 20 ft, even 40 ft). */
+export const fmtSlot = (b: { block_code?: string | null; bay?: number | null; row?: number | null; tier?: number | null; half?: number | null }) =>
+  `${b.block_code}-${bayCode(b.bay!, b.half)}-${String(b.row).padStart(2, "0")}-${b.tier}`;
 
 export const fmtClock = (t: number) => {
   const s = Math.floor(t);

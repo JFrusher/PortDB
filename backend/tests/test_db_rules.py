@@ -28,8 +28,8 @@ async def discharge_to(conn, vessel: int, slot: dict) -> str:
     return box
 
 
-def slot(block="A", bay=1, row=1, tier=1):
-    return {"block_code": block, "bay": bay, "row": row, "tier": tier}
+def slot(block="A", bay=1, row=1, tier=1, half=0):
+    return {"block_code": block, "bay": bay, "row": row, "tier": tier, "half": half}
 
 
 def rejects(fragment: str):
@@ -64,8 +64,8 @@ def test_rejects_bad_check_digit(db):
         async with await connect(url) as conn:
             with rejects("iso6346_valid|containers_id_check"):
                 await conn.execute(
-                    """INSERT INTO containers (id, iso_type, weight_kg, vessel_id, vessel_bay, vessel_row, vessel_tier)
-                       VALUES ('CSQU3054384', '22G1', 5000, %s, 1, 1, 11)""", (vessel,))
+                    """INSERT INTO containers (id, iso_type, weight_kg, vessel_id, vessel_bay, vessel_row, vessel_tier, vessel_half)
+                       VALUES ('CSQU3054384', '22G1', 5000, %s, 1, 1, 11, 1)""", (vessel,))
     run(go())
 
 
@@ -143,7 +143,7 @@ def test_clearance_cte_lists_blockers_top_down(db):
             assert [r["is_target"] for r in rows] == [False, False, True]
             assert {r["shifter_moves"] for r in rows} == {2}
             assert await q.clearance(conn, boxes[3]) == [
-                {"id": boxes[3], "block_code": "A", "bay": 1, "row": 1, "tier": 4,
+                {"id": boxes[3], "block_code": "A", "bay": 1, "row": 1, "tier": 4, "half": 0, "bay_code": "02",
                  "depth": 0, "is_target": True, "shifter_moves": 0}]
     run(go())
 
@@ -155,8 +155,10 @@ def test_allocation_builds_to_tier_3_and_avoids_own_stack(db):
         async with await connect(url) as conn:
             await discharge_to(conn, vessel, slot())
             async with conn.transaction():
-                assert await q.allocate_slot(conn, "A") == slot(tier=2)
-                assert await q.allocate_slot(conn, "A", avoid=(1, 1)) == slot(row=2, tier=1)
+                assert await q.allocate_slot(conn, "A", True) == slot(tier=2)
+                assert await q.allocate_slot(conn, "A", True, avoid=(1, 1)) == slot(row=2, tier=1)
+                # a 20 may not join a 40 stack: it starts its own, fore half first
+                assert await q.allocate_slot(conn, "A", False) == slot(row=2, tier=1, half=1)
     run(go())
 
 
@@ -272,7 +274,7 @@ def test_shift_start_yard_obeys_every_rule(pg_url):
 async def export_in_yard(conn, rng, n, **over):
     """n export boxes on their own tier-1 slots in block D, committed."""
     boxes = [cargo(rng, "EXPORT") | {"state": "STACKED_IN_YARD", "block_code": "D", "bay": 1, "row": r, "tier": 1,
-                                     "hazmat": False} | over for r in range(1, n + 1)]
+                                     "half": 0, "hazmat": False} | over for r in range(1, n + 1)]
     await insert_boxes(conn, boxes)
     await conn.commit()
     return boxes
@@ -291,7 +293,7 @@ async def load(conn, box, vessel, tier):
     async with conn.transaction():
         await q.load_on_agv(conn, box, "AGV-1")
     async with conn.transaction():
-        await q.load_on_vessel(conn, box, vessel, 1, 1, tier)
+        await q.load_on_vessel(conn, box, vessel, 1, 1, tier, 0)
     async with conn.transaction():
         await q.stow(conn, box)
 
@@ -339,7 +341,7 @@ def test_imports_never_load_and_exports_never_truck_out(db):
             other = await empty_vessel(conn)
             with rejects("illegal_transition"):
                 async with conn.transaction():
-                    await q.load_on_vessel(conn, box, other, 1, 1, 1)
+                    await q.load_on_vessel(conn, box, other, 1, 1, 1, 0)
             (export,) = await export_in_yard(conn, random.Random(3), 1)
             await retrieve(conn, export["id"])
             with rejects("illegal_transition"):
@@ -403,4 +405,75 @@ def test_quay_cranes_cannot_pass_each_other(db):
             qc1, qc2 = float(spans["QC-1"].upper), float(spans["QC-2"].lower)
             assert await q.claim_rail(conn, "QC-1", qc1 - 1.8, qc2 + 0.5) is False   # would sweep through QC-2
             assert await q.claim_rail(conn, "QC-1", qc1 - 1.8, qc2 - 0.1) is True    # right up to it is fine
+    run(go())
+
+
+# --- 20 ft / 40 ft (migration 0004) -------------------------------------------------------------
+
+def yard_box(rng, forty, bay, row, tier, half):
+    return cargo(rng, "EXPORT", hazmat_ok=False, forty=forty) | {
+        "state": "STACKED_IN_YARD", "block_code": "D", "bay": bay, "row": row, "tier": tier, "half": half}
+
+
+def test_iso_bay_codes(db):
+    url, _ = db
+
+    async def go():
+        async with await connect(url) as conn:
+            row = await (await conn.execute(
+                "SELECT bay_code(1, 1) a, bay_code(1, 2) b, bay_code(1, 0) c, bay_code(2, 0) d, bay_code(2, 1) e")).fetchone()
+            assert list(row.values()) == ["01", "03", "02", "06", "05"]
+    run(go())
+
+
+def test_two_twenties_share_a_slot_and_each_column_needs_support(db):
+    url, _ = db
+    rng = random.Random(11)
+
+    async def go():
+        async with await connect(url) as conn:
+            await insert_boxes(conn, [yard_box(rng, False, 1, 1, 1, 1), yard_box(rng, False, 1, 1, 1, 2),
+                                      yard_box(rng, False, 1, 1, 2, 1)])
+            await conn.commit()                                       # fore + aft pair, then fore on fore
+            with rejects("stack_gravity"):
+                await insert_boxes(conn, [yard_box(rng, False, 1, 2, 2, 2)])   # aft column, nothing beneath
+                await conn.commit()
+    run(go())
+
+
+def test_forty_never_on_twenty_and_stacks_hold_one_length(db):
+    url, _ = db
+    rng = random.Random(12)
+
+    async def go():
+        async with await connect(url) as conn:
+            await insert_boxes(conn, [yard_box(rng, False, 1, 1, 1, 1), yard_box(rng, False, 1, 1, 1, 2)])
+            await conn.commit()
+            with rejects("stack_mixed_lengths"):
+                await insert_boxes(conn, [yard_box(rng, True, 1, 1, 2, 0)])
+                await conn.commit()
+            await conn.rollback()
+            with rejects("containers_half_matches_length"):
+                await insert_boxes(conn, [yard_box(rng, True, 1, 2, 1, 1)])   # a 40 cannot claim a 20 ft half
+    run(go())
+
+
+def test_sixty_foot_wagon_positions(db):
+    url, _ = db
+    rng = random.Random(13)
+
+    async def go():
+        async with await connect(url) as conn:
+            train = await q.arrive_train(conn, "RS-T", 8)
+            await conn.commit()
+            rail = lambda forty, w, p: cargo(rng, "EXPORT", forty=forty) | {  # noqa: E731
+                "state": "ON_RAIL", "train_id": train, "wagon": w, "wagon_slot": p}
+            await insert_boxes(conn, [rail(True, 1, 1), rail(False, 1, 3)])      # 40 + 20 fills a 60 ft wagon
+            await conn.commit()
+            with rejects("wagon_overlap"):
+                await insert_boxes(conn, [rail(False, 2, 2), rail(True, 2, 1)])
+                await conn.commit()
+            await conn.rollback()
+            with rejects("containers_wagon_position"):
+                await insert_boxes(conn, [rail(True, 3, 3)])                   # a 40 would hang off the end
     run(go())

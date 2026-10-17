@@ -45,8 +45,12 @@ def pg_url():
 
 
 @pytest.fixture
-def db(pg_url):
-    """Fresh terminal with one berthed vessel (fixed seed). Returns (url, vessel_id)."""
+def db(pg_url, monkeypatch):
+    """Fresh terminal with one berthed vessel (fixed seed), every box 40 ft unless a test says otherwise.
+    Returns (url, vessel_id)."""
+    from portdb import config
+    monkeypatch.setattr(config, "SHARE_40FT", 1.0)
+
     async def setup():
         async with await connect(pg_url) as conn:
             await reset(conn)
