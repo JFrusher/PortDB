@@ -36,7 +36,7 @@ LOAD_PREFETCH = 3                                 # export boxes an AGV may be f
 LOAD_WINDOW_S = 360.0                             # a vessel sails when nothing more fits or this runs out
 AGV_NODES_PER_S = 4.0
 RTG_MOVE_S = 2.5                                  # per box handled: stack, reshuffle hop or truck/AGV load
-LORRY_MEAN_GAP_S = {"IMPORT": 6.5, "EXPORT": 20.0}  # two Poisson streams: pick-ups and drop-offs
+LORRY_MEAN_GAP_S = {"IMPORT": 6.5, "EXPORT": 13.0}  # two Poisson streams: pick-ups and drop-offs
 LORRY_SPEED = 4.0                                 # cells per second on the truck lanes
 GATE_CHECKIN_S = 1.5
 GATE_CHECKOUT_S = 1.0
@@ -46,7 +46,7 @@ NEXT_VESSEL_GAP_S = 8.0
 NEXT_VESSEL_YARD_MAX = 0.75                      # a berth takes its next ship once import stacks drop below this
 
 TRAIN_WAGONS = 10                                 # 2 box slots per flat wagon
-TRAIN_INBOUND = 8                                # export boxes a train brings in
+TRAIN_INBOUND = 12                               # export boxes a train brings in
 FIRST_TRAIN_S = 40.0
 TRAIN_WINDOW_S = 200.0
 TRAIN_RUN_S = 10.0

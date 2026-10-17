@@ -114,8 +114,8 @@ export function Agv({ id, home }: { id: string; home: V3 }) {
   const ref = useMover(id, home, true);
   const detail = useDetail();
   const beacon = useRef<THREE.MeshStandardMaterial>(null!);
-  useFrame(({ clock }) => {
-    const on = moving(world.tracks.get(id), simNow()) && Math.sin(clock.elapsedTime * 9) > 0;
+  useFrame(() => {
+    const on = moving(world.tracks.get(id), simNow()) && Math.sin(simNow() * 9) > 0;
     beacon.current.emissiveIntensity = on ? 2.4 : 0.1;
   });
   return (
@@ -280,11 +280,11 @@ function ShipModel({ L, v }: { L: Layout; v: Vessel }) {
   const detail = useDetail();
   const b = L.berths.find((x) => x.id === v.berth)!;
   const g = cached(`ship:${b.x0}:${v.bays}:${v.rows}`, () => buildShip(L, b.x0, v.bays, v.rows));
-  useFrame(({ clock }) => {
+  useFrame(() => {
     const dx = shipOffset(L, world.vessels.get(v.id), simNow());
     ref.current.visible = dx != null;
     if (dx == null) return;
-    const t = clock.elapsedTime;
+    const t = simNow();
     ref.current.position.set(dx, Math.sin(t * 0.9 + v.berth) * 0.025, 0);
     ref.current.rotation.x = Math.sin(t * 0.7 + v.berth) * 0.004;
     if (lines.current) lines.current.visible = Math.abs(dx) < 0.01;   // mooring lines only while alongside
@@ -513,13 +513,13 @@ export function Scanner({ id, pos, across }: { id: string; pos: V3; across: "x" 
   const bar = useRef<THREE.Mesh>(null!);
   const lamp = useRef<THREE.MeshStandardMaterial>(null!);
   const detail = useDetail();
-  useFrame(({ clock }) => {
+  useFrame(() => {
     const s = world.scans.get(id);
     const now = simNow();
     const live = !!s && now >= s.t0 && now < s.t1;
     bar.current.visible = live;
     if (live) bar.current.position.x = Math.sin((now - s!.t0) * Math.PI) * 0.7;
-    lamp.current.emissiveIntensity = live ? (Math.sin(clock.elapsedTime * 8) > 0 ? 2.2 : 0.4) : 0.15;
+    lamp.current.emissiveIntensity = live ? (Math.sin(simNow() * 8) > 0 ? 2.2 : 0.4) : 0.15;
   });
   return (
     <group position={pos} rotation-y={across === "x" ? Math.PI / 2 : 0}>
@@ -655,8 +655,8 @@ export function People({ L }: { L: Layout }) {
   const q = useMemo(() => new THREE.Quaternion(), []);
   const one = useMemo(() => new THREE.Vector3(1, 1, 1), []);
   const p = useMemo(() => new THREE.Vector3(), []);
-  useFrame(({ clock }) => {
-    const t = clock.elapsedTime;
+  useFrame(() => {
+    const t = simNow();
     let wi = 0;
     let oi = 0;
     const pos: V3 = [0, 0, 0];

@@ -70,8 +70,8 @@ function Rig() {
 function Water() {
   const geo = useMemo(() => new THREE.PlaneGeometry(SPAN + 100, 50, 110, 26), []);
   const base = useMemo(() => Float32Array.from(geo.attributes.position.array), [geo]);
-  useFrame(({ clock }) => {
-    const t = clock.elapsedTime;
+  useFrame(() => {
+    const t = simNow();
     const pos = geo.attributes.position as THREE.BufferAttribute;
     for (let i = 0; i < pos.count; i++) {
       const x = base[i * 3];
@@ -269,8 +269,8 @@ function Tug() {
     () => new Parts().box([1.4, 0.35, 0.6], [0, 0.1, 0], C.boot).box([0.6, 0.4, 0.45], [-0.15, 0.45, 0], C.ivory).cyl(0.07, 0.3, [-0.35, 0.8, 0], C.steel).build(),
     [],
   );
-  useFrame(({ clock }) => {
-    const t = clock.elapsedTime;
+  useFrame(() => {
+    const t = simNow();
     ref.current.position.set(48 + Math.sin(t * 0.12) * 6, -0.12 + Math.sin(t * 1.3) * 0.04, -12 + Math.cos(t * 0.12) * 2);
     ref.current.rotation.set(Math.sin(t * 1.1) * 0.03, Math.cos(t * 0.12) * 0.6 + Math.PI, Math.sin(t * 0.9) * 0.04);
   });
