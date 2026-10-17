@@ -330,7 +330,8 @@ function Containers({ L, selected, onPick }: { L: Layout; selected: string | nul
       if (n >= MAX_BOXES || !boxPos(L, b, now, tmpV)) continue;
       const forty = b.iso_type.startsWith("4");
       tmpP.set(tmpV[0], tmpV[1] + L.box_h * 0.46, tmpV[2]);
-      tmpS.set(forty ? 0.94 : 0.46, L.box_h * 0.92, 0.78);
+      // real proportions: 40 ft is ~2.5x its width, 20 ft half that, so both read as lying along the quay
+      tmpS.set(forty ? 0.94 : 0.46, L.box_h * 0.92, 0.36);
       m.setMatrixAt(n, tmpM.compose(tmpP, tmpQ, tmpS));
       // exports wear the colour of their port of discharge, so the stowage rule shows on deck
       const color =
