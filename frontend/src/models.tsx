@@ -59,28 +59,19 @@ export const useQuality = () => useSyncExternalStore(subView, () => view.quality
 
 // --- pose from tracks ------------------------------------------------------------------------
 const tmp: V3 = [0, 0, 0];
-const ahead: V3 = [0, 0, 0];
 
-/** Group follows the unit's latest track (or its home); vehicles turn smoothly toward their motion. */
-export function useMover(id: string, home: V3, turn: boolean) {
+/**
+ * Group follows the unit's latest track (or its home). Nothing turns: containers always lie along
+ * the quay (x), and so must whatever carries them. AGVs crab-steer, as real terminal AGVs do, and
+ * lorries only ever drive east, stepping sideways into their loading spots.
+ */
+export function useMover(id: string, home: V3) {
   const ref = useRef<THREE.Group>(null!);
-  useFrame((_, dt) => {
+  useFrame(() => {
     const tr = world.tracks.get(id);
-    const now = simNow();
-    if (tr) trackAt(tr, now, tmp);
+    if (tr) trackAt(tr, simNow(), tmp);
     else Object.assign(tmp, home);
     ref.current.position.set(tmp[0], tmp[1], tmp[2]);
-    if (turn && moving(tr, now)) {
-      trackAt(tr!, now + 0.08, ahead);
-      const dx = ahead[0] - tmp[0];
-      const dz = ahead[2] - tmp[2];
-      if (dx * dx + dz * dz > 1e-5) {
-        const want = Math.atan2(-dz, dx);
-        let d = want - ref.current.rotation.y;
-        d = Math.atan2(Math.sin(d), Math.cos(d));
-        ref.current.rotation.y += d * Math.min(1, dt * 10);
-      }
-    }
   });
   return ref;
 }
@@ -111,7 +102,7 @@ const agvGeo = (() => {
 })();
 
 export function Agv({ id, home }: { id: string; home: V3 }) {
-  const ref = useMover(id, home, true);
+  const ref = useMover(id, home);
   const detail = useDetail();
   const beacon = useRef<THREE.MeshStandardMaterial>(null!);
   useFrame(() => {
@@ -158,7 +149,7 @@ function lorryGeo(tint: string) {
 }
 
 export function Lorry({ id }: { id: string }) {
-  const ref = useMover(id, [-80, 0, 0], true);
+  const ref = useMover(id, [-80, 0, 0]);
   const detail = useDetail();
   const g = useMemo(() => {
     let h = 0;
@@ -327,7 +318,7 @@ type CraneProps = { id: string; home: V3; L: Layout };
 
 /** Frame slides along x with the spreader; trolley + hoist cables follow the spreader. */
 function useGantry(id: string, home: V3, top: number, L: Layout) {
-  const spreader = useMover(id, home, false);
+  const spreader = useMover(id, home);
   const frame = useRef<THREE.Group>(null!);
   const trolley = useRef<THREE.Group>(null!);
   const cable = useRef<THREE.Mesh>(null!);
