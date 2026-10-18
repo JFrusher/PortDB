@@ -5,7 +5,7 @@ import { useSyncExternalStore } from "react";
 
 export type V3 = [number, number, number];
 export type Kind = "QC" | "RTG" | "RMG" | "AGV" | "LORRY" | "TRAIN" | "BOX";
-export type Track = { id: string; kind: Kind; t0: number; t1: number; path: V3[] };
+export type Track = { id: string; kind: Kind; t0: number; t1: number; path: V3[]; legs?: number[] };
 export type Box = {
   id: string;
   iso_type: string;
@@ -111,7 +111,7 @@ export const world = {
   boxes: new Map<string, Box>(),
   tracks: new Map<string, Track>(),
   lorries: new Set<string>(),
-  clock: { t: 0, at: performance.now(), speed: 1, paused: false },
+  clock: { t: 0, at: performance.now(), speed: 1, paused: false, rate: 1 },
   vessels: new Map<number, Vessel>(), // by vessel id
   train: null as Train | null,
   scans: new Map<string, Scan>(),
@@ -152,15 +152,30 @@ export const useWorldSelect = <T,>(pick: (w: typeof world) => T): T => useSyncEx
 // --- sim clock ----------------------------------------------------------------------------
 export function simNow(): number {
   const c = world.clock;
-  return c.paused ? c.t : c.t + ((performance.now() - c.at) / 1000) * c.speed;
+  return c.paused ? c.t : c.t + ((performance.now() - c.at) / 1000) * c.speed * c.rate;
 }
 
-function syncClock(t: number, speed: number, paused: boolean) {
+/**
+ * Playout delay: the diorama runs this far (in wall seconds) behind the server, so a movement sent at
+ * the server's "now" arrives before it is due instead of starting in the past and hopping to catch up.
+ */
+const PLAYOUT_S = 0.25;
+
+/**
+ * Follow the server's clock (less the playout delay) without ever stepping it. Stats frames arrive late by the network delay,
+ * and by varying amounts, so snapping to them makes everything stutter. Small drift is steered out by
+ * running up to 10% fast or slow; only a real gap (a stall, a tab left in the background) snaps.
+ */
+function syncClock(serverT: number, speed: number, paused: boolean) {
   const c = world.clock;
-  // only snap on real drift; tiny corrections would make movers jitter backwards
-  if (speed !== c.speed || paused !== c.paused || Math.abs(simNow() - t) > 0.3) {
-    world.clock = { t, at: performance.now(), speed, paused };
+  const t = serverT - (paused ? 0 : PLAYOUT_S * speed);
+  const now = simNow();
+  const err = t - now;
+  if (speed !== c.speed || paused !== c.paused || Math.abs(err) > 2) {
+    world.clock = { t, at: performance.now(), speed, paused, rate: 1 };
+    return;
   }
+  world.clock = { t: now, at: performance.now(), speed, paused, rate: 1 + Math.max(-0.1, Math.min(0.1, err * 0.5)) };
 }
 
 // --- motion -------------------------------------------------------------------------------
@@ -213,7 +228,7 @@ export function trackAt(tr: Track, now: number, out: V3 = [0, 0, 0]): V3 {
     const ramp = tr.kind === "TRAIN" ? T * 0.45 : tr.kind === "LORRY" ? 0.7 : 0.3;
     return along(tr.path, trapezoid(t, T, ramp), out);
   }
-  const f = T > 0 ? clamp01(t / T) * n : n;
+  const f = legAt(tr, now);
   const i = Math.min(Math.floor(f), n - 1);
   const u = smooth(f - i);
   const a = tr.path[i];
@@ -226,19 +241,33 @@ export function trackAt(tr: Track, now: number, out: V3 = [0, 0, 0]): V3 {
 
 export const moving = (tr: Track | undefined, now: number) => !!tr && now >= tr.t0 && now < tr.t1;
 
+/** Progress through a crane track in legs (2.5 = halfway along the third leg), honouring per-leg time shares. */
+function legAt(tr: Track, now: number): number {
+  const n = tr.path.length - 1;
+  const T = tr.t1 - tr.t0;
+  let u = T > 0 ? clamp01((now - tr.t0) / T) : 1;
+  if (!tr.legs || tr.legs.length !== n) return u * n;
+  for (let i = 0; i < n; i++) {
+    const w = tr.legs[i];
+    if (u <= w || i === n - 1) return i + (w > 0 ? Math.min(1, u / w) : 1);
+    u -= w;
+  }
+  return n;
+}
+
 /**
- * Spreader sway on a crane move (5-point track: down, up, across, down). The load lags as the trolley
- * runs across, then swings past and settles as it is lowered. Crane and box tracks share timing and
- * shape, so both get the same offset and the box stays under its spreader.
+ * Spreader sway on a crane move (approach legs, then down, up, across loaded, down). The load lags as
+ * the trolley runs across, then swings past and settles as it is lowered. Crane and box tracks share
+ * timing and leg count, so both get the same offset and the box stays under its spreader.
  */
 export function swayAt(tr: Track, now: number, out: [number, number]): [number, number] {
   out[0] = out[1] = 0;
-  if (tr.path.length !== 5 || tr.kind === "AGV" || tr.kind === "LORRY" || tr.kind === "TRAIN") return out;
-  const T = tr.t1 - tr.t0;
-  const f = T > 0 ? clamp01((now - tr.t0) / T) * 4 : 4;
+  const n = tr.path.length - 1;
+  if (n < 4 || tr.kind === "AGV" || tr.kind === "LORRY" || tr.kind === "TRAIN") return out;
+  const f = legAt(tr, now) - (n - 4); // 2..3 loaded travel, 3..4 lowering
   if (f <= 2 || f >= 4) return out;
-  const a = tr.path[2];
-  const b = tr.path[3];
+  const a = tr.path[n - 2];
+  const b = tr.path[n - 1];
   const dx = b[0] - a[0];
   const dz = b[2] - a[2];
   const len = Math.hypot(dx, dz);
@@ -306,7 +335,8 @@ const ON_SHIP = new Set(["STOWED_ON_BOARD", "DISCHARGING", "LOADING", "SAILED"])
 
 /** Where a box is drawn (bottom centre). */
 export function boxPos(L: Layout, b: Box, now: number, out: V3): V3 | null {
-  const own = world.tracks.get(b.id);
+  let own = world.tracks.get(b.id);
+  if (own && now < own.t0) own = undefined; // not lifted yet
   if (own && now < own.t1) {
     trackAt(own, now, out); // mid-crane, swinging with the spreader
     swayAt(own, now, tmpSway);
@@ -362,6 +392,33 @@ function log(t: number, text: string, level: Level = "info") {
 
 const GONE = new Set(["SAILED", "RAIL_OUT", "GATE_OUT"]);
 
+// A box's new position commits before the crane move that carries it there is streamed (the engine
+// animates what the database accepted), and the two travel by different routes. Applied as they come,
+// the box would blink to its new slot or its last resting place first. So a moved box waits, briefly,
+// for its crane track; most arrive within a few tens of milliseconds.
+const HOLD_MS = 400;
+const held = new Map<string, { ev: any; timer: ReturnType<typeof setTimeout> }>();
+const POSITION = ["block_code", "bay", "row", "tier", "half", "vessel_bay", "vessel_row", "vessel_tier", "vessel_half", "wagon", "wagon_slot"];
+
+function release(id: string) {
+  const h = held.get(id);
+  if (!h) return;
+  clearTimeout(h.timer);
+  held.delete(id);
+  applyBox(h.ev);
+  changed();
+}
+
+function receiveBox(ev: any) {
+  release(ev.id); // an older version still waiting goes first
+  const prev = world.boxes.get(ev.id);
+  const own = world.tracks.get(ev.id);
+  // a quay crane hands over after its lift (the track came first): nothing to wait for
+  const moved = prev && prev.state !== "DISCHARGING" && POSITION.some((k) => k in ev && (prev as any)[k] !== ev[k]);
+  if (!moved || (own && own.t0 >= ev.t - 0.05)) return applyBox(ev);
+  held.set(ev.id, { ev, timer: setTimeout(() => release(ev.id), HOLD_MS) });
+}
+
 /** A box version from the database's change feed (or the history, in replay). Logs what changed. */
 function applyBox(ev: any) {
   const { type: _type, t, ...row } = ev;
@@ -387,6 +444,9 @@ function setVessel(v: Vessel) {
 }
 
 function hydrate(ev: any) {
+  due.length = 0;
+  for (const h of held.values()) clearTimeout(h.timer);
+  held.clear();
   world.boxes = new Map(ev.boxes.map((b: Box) => [b.id, b]));
   world.tracks = new Map(ev.tracks.map((t: Track) => [t.id, t]));
   world.lorries = new Set(ev.tracks.filter((t: Track) => t.kind === "LORRY").map((t: Track) => t.id));
@@ -404,15 +464,18 @@ function apply(ev: any) {
     case "hello":
       world.layout = ev.layout;
       hydrate(ev);
-      world.clock = { t: ev.sim.t, at: performance.now(), speed: ev.sim.speed, paused: ev.sim.paused };
+      world.clock = { t: ev.sim.t - (ev.sim.paused ? 0 : PLAYOUT_S * ev.sim.speed), at: performance.now(), speed: ev.sim.speed, paused: ev.sim.paused, rate: 1 };
       world.liveT = ev.sim.t;
       break;
-    case "track":
+    case "track": {
       world.tracks.set(ev.id, ev);
       if (ev.kind === "LORRY") world.lorries.add(ev.id);
+      const h = held.get(ev.id);
+      if (h && ev.t0 >= h.ev.t - 0.05) release(ev.id); // the move this box was waiting for
       return; // motion only: no HUD change
+    }
     case "box":
-      applyBox(ev);
+      receiveBox(ev);
       break;
     case "weather":
       world.weather = ev;
@@ -471,6 +534,25 @@ function apply(ev: any) {
   changed();
 }
 
+// --- playout ------------------------------------------------------------------------------
+// Live events wait here until the diorama's clock (which runs PLAYOUT_S behind the server) reaches
+// their timestamp: a track at its start, everything else at the moment it happened. Applied early, a
+// vehicle's next track would replace the one it is still driving and it would skip ahead.
+const due: any[] = [];
+const dueAt = (ev: any): number => (ev.type === "track" ? ev.t0 : ev.t);
+
+function enqueue(ev: any) {
+  let i = due.length;
+  while (i > 0 && dueAt(due[i - 1]) > dueAt(ev)) i--;
+  due.splice(i, 0, ev);
+}
+
+(function play() {
+  const now = simNow();
+  while (due.length && dueAt(due[0]) <= now) apply(due.shift());
+  requestAnimationFrame(play);
+})();
+
 let socket: WebSocket | null = null;
 export function connect() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
@@ -481,7 +563,7 @@ export function connect() {
   };
   ws.onmessage = (m) => {
     const ev = JSON.parse(m.data);
-    if (world.mode === "live") apply(ev);
+    if (world.mode === "live") (ev.type === "hello" || ev.type === "stats" ? apply : enqueue)(ev);
     else if (ev.type === "stats") {
       world.liveT = ev.t; // replaying: only keep track of where "now" is
       world.stats = ev;
@@ -508,7 +590,7 @@ export async function seek(t: number) {
   hydrate(s);
   world.log = [];
   world.journey = null;
-  world.clock = { t: s.sim.t, at: performance.now(), speed: world.clock.speed || 1, paused: false };
+  world.clock = { t: s.sim.t, at: performance.now(), speed: world.clock.speed || 1, paused: false, rate: 1 };
   replay.queue = [];
   replay.fetchedTo = s.sim.t;
   clearInterval(replay.timer);
@@ -594,4 +676,4 @@ export async function post(path: string) {
 }
 
 // a handle for the browser console and the footage recorder (scripts/capture.js)
-Object.assign(window, { portdb: { world, replay, seek, goLive, simNow } });
+Object.assign(window, { portdb: { world, replay, seek, goLive, simNow, boxPos } });

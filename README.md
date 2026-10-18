@@ -159,7 +159,7 @@ Each of these was a real bug in the engine, stopped by the database or by a test
 
 <p align="center"><img src="docs/media/landside.gif" width="960" alt="A train loaded by the rail crane, then the customs X-ray scanning a lorry"></p>
 
-- **Server owns time.** Each movement is sent once as a path with start and end times in simulated seconds; the browser interpolates against its own copy of the clock. Spreaders swing as the trolley runs and settle as they lower, and the box swings with them.
+- **Server owns time.** Each movement is sent once as a path with start and end times in simulated seconds; the browser interpolates against its own copy of the clock, a quarter-second behind the server's so every movement is in hand before it is due. The clock is steered, never stepped, and a box's move is held until the crane that carries it is. Spreaders swing as the trolley runs and settle as they lower, and the box swings with them.
 - **A simulated day.** The sun crosses in fifteen minutes, floodlights pool on the yard at night, ships show navigation lights, and fog, rain and a choppy harbour follow the weather rows. Tugs bring ships alongside, leaving a wake.
 - **Colour by data.** Boxes wear their shipping line's livery from a texture atlas, one tile index per instance. Switch to port of discharge, weight, yard dwell, re-handles or reefer power, read straight from the change feed.
 - **Few draw calls.** Every model is one merged vertex-coloured mesh and all containers are one instanced mesh, so it stays smooth on integrated graphics. Quality adapts to the frame rate; pin it with `?q=0`, `?q=1` or `?q=2`.

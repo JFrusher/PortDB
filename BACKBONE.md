@@ -536,3 +536,10 @@ The engine's `lift(unit, step)` wraps every crane transaction: a `wind_limit` or
 - **Dual cycling:** during discharge a QC keeps one export on its way to a bay it has emptied and loads it between discharges at `DUAL_CYCLE_FACTOR` of a cycle. Discharge only peeks bays that still hold inbound cargo.
 - **Make way:** an idle crane steps aside when a neighbour is blocked on rail it stands on.
 - **Smart placement:** `allocate_slot(..., box=)` orders by "the box below leaves after this one" (exports by port then weight, imports by onward mode) then by tier, and filters slots by IMDG distance. `python -m portdb.bench` compares strategies.
+
+### Smooth playback (diorama)
+
+- **Playout buffer:** the browser's clock runs `PLAYOUT_S` (0.25 s of wall time) behind the server. Live events are queued and applied when the clock reaches their time (a track at `t0`, everything else at `t`), so a vehicle's next track never replaces the one it is still driving.
+- **Clock steering:** stats frames arrive late by varying network delay. Drift under 2 s is removed by running the clock up to 10% fast or slow; it is never stepped backwards.
+- **Box holds:** a box's new position is committed before the crane move that carries it is streamed. A moved box waits (up to 400 ms) for that track, except after a quay-crane hand-over, where the lift came first.
+- **Crane tracks** start from wherever the spreader is (hoist, travel, lower, lift, travel, lower), and each leg's share of the time is proportional to its length (`legs` on the track event). The box's track carries the same shares, so it stays under the spreader.

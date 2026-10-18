@@ -61,6 +61,31 @@ def is_forty(box: dict) -> bool:
     return box["iso_type"].startswith("4")
 
 
+def trapezoid(t: float, T: float, ramp: float) -> float:
+    """Fraction of a vehicle track covered after t of T seconds: the browser's speed profile
+    (world.ts trapezoid), so a position computed here matches the one drawn there."""
+    if T <= 0 or t >= T:
+        return 1.0
+    if t <= 0:
+        return 0.0
+    r = min(ramp, T / 2)
+    v = 1 / (T - r)
+    if t < r:
+        return v * t * t / (2 * r)
+    if t > T - r:
+        return 1 - v * (T - t) ** 2 / (2 * r)
+    return v * (t - r / 2)
+
+
+def leg_shares(path, floor: float = 0.6) -> list[float]:
+    """Share of a crane move's time per leg, by length: a long trolley run takes longer than a short
+    hoist, so the spreader moves at a believable, even pace. `floor` keeps short legs (locking on to a
+    box) from being instant."""
+    w = [max(math.dist(a, b), floor) for a, b in zip(path, path[1:])]
+    total = sum(w)
+    return [x / total for x in w]
+
+
 def near(cells, to) -> list:
     """Cells nearest first: by Manhattan distance to a node, or by x alone when given a number."""
     if isinstance(to, tuple):
@@ -335,10 +360,13 @@ class Terminal:
     def send(self, kind: str, **body) -> None:
         self.emit({"type": kind, "t": round(self.env.now, 3), **body})
 
-    def track(self, unit: str, kind: str, path, duration: float, t0: float | None = None) -> None:
+    def track(self, unit: str, kind: str, path, duration: float, t0: float | None = None, legs=None) -> None:
+        """`legs`: each leg's share of the duration (crane moves); vehicles move by arc length instead."""
         t0 = self.env.now if t0 is None else t0
         ev = {"type": "track", "id": unit, "kind": kind, "t0": round(t0, 3), "t1": round(t0 + duration, 3),
               "path": [[round(c, 3) for c in p] for p in path]}
+        if legs:
+            ev["legs"] = [round(w, 4) for w in legs]
         self.tracks[unit] = ev
         self.emit(ev)
 
@@ -454,10 +482,19 @@ class Terminal:
         yield self.env.timeout(duration)
 
     def crane(self, unit: str, kind: str, box: str, src, dst, clear_y: float, duration: float) -> None:
-        """Spreader descends to src, hoists, travels, lowers to dst. The box rides from the second waypoint."""
+        """From wherever the spreader is: hoist clear, travel over src, lower, lift the box, travel,
+        lower to dst. The box's track has the same legs and sits at src until it is lifted, so the
+        two stay together (and swing together)."""
         up_src, up_dst = L.lifted(src, clear_y), L.lifted(dst, clear_y)
-        self.track(unit, kind, [up_src, src, up_src, up_dst, dst], duration)
-        self.track(box, "BOX", [src, src, up_src, up_dst, dst], duration)
+        cur = self.unit_point(unit)
+        approach = []
+        for p in (cur, L.lifted(cur, clear_y), up_src):
+            if not approach or math.dist(approach[-1], p) > 1e-3:
+                approach.append(tuple(p))
+        path = approach + [src, up_src, up_dst, dst]
+        legs = leg_shares(path)
+        self.track(unit, kind, path, duration, legs=legs)
+        self.track(box, "BOX", [src] * len(approach) + [src, up_src, up_dst, dst], duration, legs=legs)
 
     def gantry(self, crane: str, x: float, job="any"):
         """Travel along the rail. The DB refuses an envelope that overlaps a neighbour, so cranes wait.
@@ -480,7 +517,8 @@ class Terminal:
         p = last["path"][-1] if last else (cur, clear, -2.0 if kind == "QC" else L.RAIL_Z - 1)
         speed = config.QC_GANTRY_SPEED if kind == "QC" else config.RMG_GANTRY_SPEED
         duration = abs(x - cur) / speed + 0.6
-        self.track(crane, kind, [p, (p[0], clear, p[2]), (x, clear, p[2])], duration)
+        path = [p, (p[0], clear, p[2]), (x, clear, p[2])]
+        self.track(crane, kind, path, duration, legs=leg_shares(path))
         yield self.env.timeout(duration)
         yield self.db(q.claim_rail, crane, x - half, x + half)   # shrink to where we stand: a subset, never clashes
         self.crane_x[crane] = x
@@ -945,11 +983,17 @@ class Terminal:
             self.spawn(self.lorry(f"LRY-{flow[0]}{n}", flow))
 
     def queue_shift(self) -> None:
+        """Close up the gate queue. A lorry still rolling in carries on from where it is now (not from
+        where it was heading), at road speed."""
+        now = self.env.now
         for k, lorry in enumerate(self.gate_queue):
             tr = self.tracks.get(lorry)
             x = L.QUEUE_HEAD_X - 2.2 * k
-            if tr and abs(tr["path"][-1][0] - x) > 0.01:
-                self.track(lorry, "LORRY", [tr["path"][-1], (x, 0, L.THRU_Z)], 1.2)
+            if not tr or abs(tr["path"][-1][0] - x) <= 0.01:
+                continue
+            (x0, y, z), x1 = tr["path"][0], tr["path"][-1][0]
+            at = x0 + (x1 - x0) * trapezoid(now - tr["t0"], tr["t1"] - tr["t0"], 0.7)
+            self.track(lorry, "LORRY", [(at, y, z), (x, 0, L.THRU_Z)], max(0.6, abs(x - at) / config.LORRY_SPEED))
 
     def lorry(self, lorry: str, flow: str):
         plate = "".join(self.rng.choices(string.ascii_uppercase, k=2)) + f"{self.rng.randint(10, 99)} " + \

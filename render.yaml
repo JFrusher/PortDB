@@ -5,6 +5,7 @@ services:
   - type: web
     name: portdb-api
     runtime: docker
+    region: frankfurt    # next to Supabase eu-west-2: every transaction is a round trip
     rootDir: backend
     plan: free
     healthCheckPath: /api/layout
@@ -17,6 +18,7 @@ services:
   - type: web
     name: portdb
     runtime: docker
+    region: frankfurt
     rootDir: frontend
     plan: free
     envVars:
