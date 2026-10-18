@@ -56,7 +56,7 @@ def db(pg_url, monkeypatch):
             await reset(conn)
             vessel = await seed_vessel(conn, random.Random(7))
             # neutral cargo: each test sets the flag it is about
-            await conn.execute("UPDATE containers SET hazmat = false, customs_hold = false, "
+            await conn.execute("UPDATE containers SET hazmat = false, imdg_class = NULL, customs_hold = false, "
                                "flow = 'IMPORT', mode = 'TRUCK', pod = NULL")
             return vessel
     return pg_url, run(setup())

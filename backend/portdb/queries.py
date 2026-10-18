@@ -64,13 +64,23 @@ async def choose_block(conn: AsyncConnection, hazmat: bool, purpose: str) -> str
 
 
 async def allocate_slot(conn: AsyncConnection, block: str, forty: bool,
-                        avoid: tuple[int, int] | None = None) -> dict | None:
+                        avoid: tuple[int, int] | None = None, box: str | None = None) -> dict | None:
     """First free supported position for a box of this length: a 40 fills a slot (half 0), 20s pair up
     fore and aft (halves 1, 2). Only stacks that are empty or already hold this length qualify.
-    Stacks are built to tier 3 before tiers 4-5 are used. `avoid` keeps a re-handled box off its own stack."""
+    Stacks are built to tier 3 before tiers 4-5 are used. `avoid` keeps a re-handled box off its own stack.
+
+    Given the box: hazardous cargo keeps its IMDG distance from incompatible classes, and under the
+    SMART strategy a box prefers to sit on one that will leave after it (exports: earlier port, or same
+    port and lighter, which is the order the load planner picks; imports: same onward mode), and the
+    yard is filled tier by tier."""
     xbay, xrow = avoid or (None, None)
+    if box:   # hazmat placements in a block take turns, so this one sees the last one's commit
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('imdg:' || %s)) FROM containers "
+                           "WHERE id = %s AND imdg_class IS NOT NULL", (block, box))
     return await (await conn.execute(
         """
+        WITH me AS (SELECT c.id, c.imdg_class, c.weight_kg, c.mode, coalesce(p.rotation, 0) AS rotation
+                    FROM containers c LEFT JOIN ports p ON p.code = c.pod WHERE c.id = %(box)s)
         SELECT s.block_code, s.bay, s.row, s.tier, h.half
         FROM yard_slots s CROSS JOIN unnest(%(halves)s::smallint[]) AS h(half)
         WHERE s.block_code = %(block)s
@@ -82,11 +92,26 @@ async def allocate_slot(conn: AsyncConnection, block: str, forty: bool,
                           WHERE (c.block_code, c.bay, c.row, c.tier, c.half) = (s.block_code, s.bay, s.row, s.tier, h.half))
           AND (s.tier = 1 OR EXISTS (SELECT 1 FROM containers c
                           WHERE (c.block_code, c.bay, c.row, c.tier, c.half) = (s.block_code, s.bay, s.row, s.tier - 1, h.half)))
-        ORDER BY s.tier > 3, s.bay, s.row, s.tier, h.half
+          AND NOT EXISTS (SELECT 1 FROM me JOIN containers o ON o.block_code = s.block_code AND o.id <> me.id
+                          JOIN imdg_segregation g ON (g.class_a, g.class_b)
+                                                   = (least(o.imdg_class, me.imdg_class), greatest(o.imdg_class, me.imdg_class))
+                          WHERE greatest(abs(o.bay - s.bay), abs(o.row - s.row)) <= g.code)
+        ORDER BY CASE WHEN %(smart)s THEN coalesce((
+                   SELECT CASE WHEN b.flow = 'IMPORT' THEN b.mode <> me.mode
+                               ELSE NOT (me.rotation > coalesce(pb.rotation, 0)
+                                         OR (me.rotation = coalesce(pb.rotation, 0) AND me.weight_kg >= b.weight_kg)) END
+                   FROM me, containers b LEFT JOIN ports pb ON pb.code = b.pod
+                   WHERE (b.block_code, b.bay, b.row, b.half, b.tier) = (s.block_code, s.bay, s.row, h.half, s.tier - 1)),
+                 false) END,
+                 -- SMART also spreads low: road pick-ups come in random order, so every tier saved
+                 -- is a re-handle saved; BASIC builds each stack to tier 3 before starting the next
+                 CASE WHEN %(smart)s THEN s.tier END,
+                 s.tier > 3, s.bay, s.row, s.tier, h.half
         LIMIT 1
         FOR UPDATE OF s SKIP LOCKED
         """,
-        {"block": block, "xbay": xbay, "xrow": xrow, "forty": forty, "halves": [0] if forty else [1, 2]},
+        {"block": block, "xbay": xbay, "xrow": xrow, "forty": forty, "halves": [0] if forty else [1, 2], "box": box,
+         "smart": config.YARD_STRATEGY == "SMART"},
     )).fetchone()
 
 
@@ -134,18 +159,19 @@ async def claim_next_box(conn: AsyncConnection, vessel_id: int, bay_lo: int, bay
     )).fetchone()
 
 
-async def peek_next_bay(conn: AsyncConnection, vessel_id: int, bay_lo: int, bay_hi: int) -> int | None:
-    """Bay of the box claim_next_box would take, without claiming it: the QC moves first, then claims."""
+async def peek_next_bay(conn: AsyncConnection, vessel_id: int, bays: list[int]) -> int | None:
+    """Bay of the box claim_next_box would take, without claiming it: the QC moves first, then claims.
+    Only bays still holding inbound cargo: under dual cycling, emptied bays fill with exports."""
     row = await (await conn.execute(
         """SELECT c.vessel_bay FROM containers c
-           WHERE c.vessel_id = %(v)s AND c.state = 'STOWED_ON_BOARD' AND c.vessel_bay BETWEEN %(lo)s AND %(hi)s
+           WHERE c.vessel_id = %(v)s AND c.state = 'STOWED_ON_BOARD' AND c.vessel_bay = ANY(%(bays)s)
              AND NOT EXISTS (SELECT 1 FROM containers a
                              WHERE (a.vessel_id, a.vessel_bay, a.vessel_row, a.vessel_half)
                                  = (c.vessel_id, c.vessel_bay, c.vessel_row, c.vessel_half)
                                AND a.vessel_tier > c.vessel_tier)
            ORDER BY c.vessel_tier DESC, c.vessel_bay, c.vessel_row, c.vessel_half
            LIMIT 1""",
-        {"v": vessel_id, "lo": bay_lo, "hi": bay_hi})).fetchone()
+        {"v": vessel_id, "bays": bays})).fetchone()
     return row and row["vessel_bay"]
 
 
@@ -240,8 +266,9 @@ async def release_equipment(conn: AsyncConnection, unit: str, x: int | None = No
         (x, z, unit))
 
 
-async def claim_rail(conn: AsyncConnection, crane: str, lo: float, hi: float) -> bool:
-    """Claim [lo, hi] of the crane's rail. Refused (False) if it overlaps a neighbour's envelope.
+async def claim_rail(conn: AsyncConnection, crane: str, lo: float, hi: float) -> str | None:
+    """Claim [lo, hi] of the crane's rail. Returns the refusing rule's name (None when granted): a
+    neighbour's envelope overlaps, or the crane is out of service.
     Claims on one rail take a transaction-scoped advisory lock first: two neighbours widening toward
     each other at the same instant would otherwise each wait on the other's uncommitted row."""
     try:
@@ -249,9 +276,13 @@ async def claim_rail(conn: AsyncConnection, crane: str, lo: float, hi: float) ->
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext(left(%s, 2)))", (crane,))
             await conn.execute("UPDATE equipment SET rail_span = numrange(%s, %s) WHERE id = %s",
                                (Decimal(str(round(lo, 3))), Decimal(str(round(hi, 3))), crane))
-        return True
-    except (errors.ExclusionViolation, errors.DeadlockDetected):
-        return False
+        return None
+    except errors.ExclusionViolation as e:
+        return e.diag.constraint_name or "rail_overlap"
+    except errors.DeadlockDetected:
+        return "deadlock_detected"
+    except errors.CheckViolation as e:
+        return str(e).split(":", 1)[0]
 
 
 # --- road bookings ---------------------------------------------------------------------------
@@ -402,7 +433,7 @@ async def pick_rail_box(conn: AsyncConnection, forty: bool | None = None) -> dic
     )).fetchone()
 
 
-async def pick_pickup(conn: AsyncConnection, plate: str) -> dict | None:
+async def pick_pickup(conn: AsyncConnection, plate: str, vehicle: str) -> dict | None:
     """Random truck-booked stacked box, marked RETRIEVING with its gate transaction opened."""
     return await (await conn.execute(
         """
@@ -411,13 +442,13 @@ async def pick_pickup(conn: AsyncConnection, plate: str) -> dict | None:
           WHERE id = (SELECT id FROM containers WHERE state = 'STACKED_IN_YARD' AND mode = 'TRUCK'
                       ORDER BY random() LIMIT 1 FOR UPDATE SKIP LOCKED)
           RETURNING id, block_code, customs_hold)
-        INSERT INTO gate_transactions (plate, container_id)
-        SELECT %s, id FROM pick
+        INSERT INTO gate_transactions (plate, vehicle, container_id)
+        SELECT %s, %s, id FROM pick
         RETURNING id AS gate_id, container_id AS box,
                   (SELECT block_code FROM pick) AS block_code,
                   (SELECT customs_hold FROM pick) AS customs_hold
         """,
-        (plate,),
+        (plate, vehicle),
     )).fetchone()
 
 
@@ -433,6 +464,11 @@ async def gate_depart(conn: AsyncConnection, gate_id: int) -> None:
 
 
 # --- ledger ----------------------------------------------------------------------------------
+
+async def gate_checkin(conn: AsyncConnection, gate_id: int) -> None:
+    """The lorry is at the in-gate booth. Refused (gate_closed) while an outage covers this moment."""
+    await conn.execute("UPDATE gate_transactions SET status = 'AT_LANE' WHERE id = %s", (gate_id,))
+
 
 async def open_task(conn: AsyncConnection, unit: str, box: str, kind: str, origin: dict, target: dict, t0: float) -> int:
     row = await (await conn.execute(
@@ -487,20 +523,245 @@ async def stats(conn: AsyncConnection) -> dict:
 
 async def get_container(conn: AsyncConnection, box: str) -> dict | None:
     return await (await conn.execute(
-        """SELECT c.id, c.iso_type, c.hazmat, c.weight_kg, c.state, c.flow, c.mode, c.pod, c.customs_hold,
-                  c.inspected_at IS NOT NULL AS inspected, c.vessel_id, c.vessel_bay, c.vessel_row, c.vessel_tier,
-                  c.vessel_half, c.block_code, c.bay, c.row, c.tier, c.half, c.carrier_id, c.train_id, c.wagon, c.wagon_slot,
-                  v.name AS vessel_name, t.name AS train_name
-           FROM containers c
-           LEFT JOIN vessels v ON v.id = c.vessel_id
-           LEFT JOIN trains t ON t.id = c.train_id
-           WHERE c.id = %s""", (box,))).fetchone()
+        """SELECT f.*, v.name AS vessel_name, t.name AS train_name
+           FROM container_feed f
+           LEFT JOIN vessels v ON v.id = f.vessel_id
+           LEFT JOIN trains t ON t.id = f.train_id
+           WHERE f.id = %s""", (box,))).fetchone()
 
 
 async def live_containers(conn: AsyncConnection) -> list[dict]:
     return await (await conn.execute(
-        """SELECT id, iso_type, hazmat, weight_kg, state, flow, mode, pod, customs_hold,
-                  inspected_at IS NOT NULL AS inspected,
-                  vessel_id, vessel_bay, vessel_row, vessel_tier, vessel_half, block_code, bay, row, tier, half,
-                  carrier_id, train_id, wagon, wagon_slot
-           FROM containers WHERE state NOT IN ('GATE_OUT', 'RAIL_OUT', 'SAILED') ORDER BY id""")).fetchall()
+        "SELECT * FROM container_feed WHERE state NOT IN ('GATE_OUT', 'RAIL_OUT', 'SAILED') ORDER BY id")).fetchall()
+
+
+# --- weather, breakdowns, outages ------------------------------------------------------------
+
+async def add_weather(conn: AsyncConnection, t: float, wind: float, gust: float, rain: float, fog: float) -> None:
+    await conn.execute("INSERT INTO weather (t, wind_ms, gust_ms, rain, fog) VALUES (%s, %s, %s, %s, %s) "
+                       "ON CONFLICT (t) DO NOTHING", (t, wind, gust, rain, fog))
+
+
+async def wind_limits(conn: AsyncConnection) -> dict:
+    rows = await (await conn.execute("SELECT kind::text AS kind, max_wind_ms FROM crane_wind_limits")).fetchall()
+    return {r["kind"]: r["max_wind_ms"] for r in rows}
+
+
+async def set_equipment_state(conn: AsyncConnection, unit: str, state: str) -> None:
+    await conn.execute("UPDATE equipment SET state = %s WHERE id = %s", (state, unit))
+
+
+async def agv_fault(conn: AsyncConnection) -> str | None:
+    """Take one idle AGV out of service (the caller already holds its pool token)."""
+    row = await (await conn.execute(
+        """UPDATE equipment SET state = 'DOWN'
+           WHERE id = (SELECT id FROM equipment WHERE kind = 'AGV' AND state = 'IDLE'
+                       ORDER BY random() LIMIT 1 FOR UPDATE SKIP LOCKED)
+           RETURNING id""")).fetchone()
+    return row and row["id"]
+
+
+async def gate_outage(conn: AsyncConnection, t0: float, t1: float, reason: str) -> bool:
+    try:
+        async with conn.transaction():
+            await conn.execute("INSERT INTO gate_outages (during, reason) VALUES (numrange(%s::numeric, %s::numeric), %s)",
+                               (round(t0, 3), round(t1, 3), reason))
+        return True
+    except errors.ExclusionViolation:          # already down: outages never overlap
+        return False
+
+
+# --- berth plan ------------------------------------------------------------------------------
+
+def quay(berth: int) -> tuple[int, int]:
+    """Quay metres (grid x) a ship at this berth takes, hull and fenders."""
+    from .layout import BERTH_X0
+    return BERTH_X0[berth] - 2, BERTH_X0[berth] + config.BERTHS[berth][1] + 4
+
+
+async def plan_window(conn: AsyncConnection, berth: int, name: str, t0: float, t1: float) -> int:
+    lo, hi = quay(berth)
+    row = await (await conn.execute(
+        """INSERT INTO berth_windows (berth_id, vessel_name, quay, during)
+           VALUES (%s, %s, int4range(%s, %s), numrange(%s::numeric, %s::numeric)) RETURNING id""",
+        (berth, name, lo, hi, round(t0, 3), round(t1, 3)))).fetchone()
+    return row["id"]
+
+
+async def move_window(conn: AsyncConnection, wid: int, start_by: float = 0.0, end_by: float = 0.0) -> bool:
+    """Shift a window's start and end. False if it would overlap another window on the same quay."""
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE berth_windows SET during = numrange(lower(during) + %s::numeric, upper(during) + %s::numeric) "
+                "WHERE id = %s AND status <> 'DONE'",   # a call that has sailed keeps its window
+                (round(start_by, 3), round(end_by, 3), wid))
+        return True
+    except errors.ExclusionViolation:
+        return False
+
+
+async def window_alongside(conn: AsyncConnection, wid: int, vessel: int, name: str, t: float) -> None:
+    """The ship is here: the window slides to start now, keeping its planned length."""
+    await conn.execute(
+        """UPDATE berth_windows SET status = 'ALONGSIDE', vessel_id = %(v)s, vessel_name = %(n)s,
+                  during = numrange(%(t)s::numeric, %(t)s::numeric + (upper(during) - lower(during)))
+           WHERE id = %(w)s""", {"v": vessel, "n": name, "t": round(t, 3), "w": wid})
+
+
+async def window_done(conn: AsyncConnection, wid: int, t: float) -> None:
+    await conn.execute(
+        "UPDATE berth_windows SET status = 'DONE', during = numrange(lower(during), greatest(%s::numeric, lower(during) + 1)) "
+        "WHERE id = %s", (round(t, 3), wid))
+
+
+async def berth_plan(conn: AsyncConnection, since: float) -> list[dict]:
+    return await (await conn.execute(
+        """SELECT id, berth_id AS berth, vessel_name AS name, status,
+                  lower(during)::float AS t0, upper(during)::float AS t1
+           FROM berth_windows WHERE upper(during) > %s ORDER BY berth_id, lower(during)""", (since,))).fetchall()
+
+
+# --- time travel ---------------------------------------------------------------------------------
+
+async def maintain(conn: AsyncConnection, now: float) -> dict:
+    """Partitions for the next ten minutes; whole partitions past retention dropped."""
+    made = (await (await conn.execute("SELECT ensure_partitions(%s, %s) AS n", (now, now + 600))).fetchone())["n"]
+    dropped = (await (await conn.execute("SELECT drop_history_before(%s) AS n",
+                                         (now - config.RETENTION_S,))).fetchone())["n"]
+    return {"made": made, "dropped": dropped}
+
+
+async def append_events(conn: AsyncConnection, rows: list[tuple]) -> None:
+    """(t, type, unit, body-json) rows in one COPY: the stream is written in batches, never per event."""
+    async with conn.cursor() as cur:
+        async with cur.copy("COPY event_log (t, type, unit, body) FROM STDIN") as copy:
+            for r in rows:
+                await copy.write_row(r)
+
+
+async def boxes_as_of(conn: AsyncConnection, t: float) -> list[dict]:
+    """Every box as it stood at simulated second t: one GiST probe on the validity range."""
+    rows = await (await conn.execute(
+        """SELECT snapshot FROM container_history
+           WHERE valid @> %(t)s::numeric AND lower(valid) <= %(t)s
+             AND state NOT IN ('SAILED', 'RAIL_OUT')""", {"t": t})).fetchall()
+    return [r["snapshot"] for r in rows]
+
+
+async def latest_events(conn: AsyncConnection, t: float, types: list[str], window: float) -> list[dict]:
+    """The last event per unit (or per body id) of these types at or before t."""
+    return await (await conn.execute(
+        """SELECT DISTINCT ON (type, coalesce(unit, body->>'id', body->>'block')) t, type, unit, body
+           FROM event_log WHERE t <= %s AND t > %s AND type = ANY(%s)
+           ORDER BY type, coalesce(unit, body->>'id', body->>'block'), t DESC""", (t, t - window, types))).fetchall()
+
+
+async def events_between(conn: AsyncConnection, t0: float, t1: float) -> list[dict]:
+    """Everything that happened in (t0, t1]: box versions from the history, the rest from the log."""
+    return await (await conn.execute(
+        """SELECT t, type, body FROM (
+             SELECT lower(valid)::float AS t, 'box' AS type, snapshot AS body
+             FROM container_history WHERE lower(valid) > %(a)s AND lower(valid) <= %(b)s
+             UNION ALL
+             SELECT t, type, body FROM event_log WHERE t > %(a)s AND t <= %(b)s) e
+           ORDER BY t""", {"a": t0, "b": t1})).fetchall()
+
+
+async def journey(conn: AsyncConnection, box: str) -> dict:
+    """Every version of a box, and every crane and vehicle movement that carried it."""
+    stops = await (await conn.execute(
+        """SELECT lower(valid)::float AS t0, upper(valid)::float AS t1, state, snapshot
+           FROM container_history WHERE container_id = %s ORDER BY lower(valid)""", (box,))).fetchall()
+    moves = await (await conn.execute(
+        """WITH carried AS (
+             SELECT snapshot->>'carrier_id' AS unit, lower(valid)::float AS t0,
+                    coalesce(upper(valid)::float, 'Infinity') AS t1
+             FROM container_history WHERE container_id = %(b)s AND snapshot->>'carrier_id' IS NOT NULL)
+           SELECT e.t, e.unit, e.body->'path' AS path, (e.body->>'t1')::float AS t1
+           FROM event_log e
+           WHERE e.type = 'track' AND (e.unit = %(b)s
+                 OR EXISTS (SELECT 1 FROM carried c WHERE c.unit = e.unit AND e.t >= c.t0 AND e.t < c.t1))
+           ORDER BY e.t""", {"b": box})).fetchall()
+    return {"stops": stops, "moves": moves}
+
+
+# --- x-ray, dashboards ---------------------------------------------------------------------------
+
+async def xray(conn: AsyncConnection, now: float, ahead: float) -> dict:
+    bookings = await (await conn.execute(
+        """SELECT vehicle, x, z, t0, least(t1, %(far)s) AS t1, t1 >= %(parked)s AS parked
+           FROM road_bookings WHERE t1 >= %(now)s AND t0 <= %(far)s""",
+        {"now": now, "far": now + ahead, "parked": PARKED})).fetchall()
+    rails = await (await conn.execute(
+        """SELECT id, kind::text AS kind, lower(rail_span)::float AS lo, upper(rail_span)::float AS hi, state::text AS state
+           FROM equipment WHERE rail_span IS NOT NULL ORDER BY id""")).fetchall()
+    outage = await (await conn.execute(
+        "SELECT reason, upper(during)::float AS until FROM gate_outages WHERE during @> %s::numeric",
+        (now,))).fetchone()
+    return {"bookings": bookings, "rails": rails, "gate_outage": outage}
+
+
+async def visible_to(conn: AsyncConnection, role: str, line: str | None) -> list[str]:
+    """The same SELECT run as another role: row-level security decides which boxes come back."""
+    async with conn.transaction():
+        await conn.execute(f"SET LOCAL ROLE {role}")       # role comes from a fixed allow-list in the API
+        if line:
+            await conn.execute("SELECT set_config('portdb.line', %s, true)", (line,))
+        rows = await (await conn.execute(
+            "SELECT id FROM container_feed WHERE state NOT IN ('GATE_OUT', 'RAIL_OUT', 'SAILED')")).fetchall()
+    return [r["id"] for r in rows]
+
+
+async def kpi(conn: AsyncConnection, since: float, bucket: float) -> list[dict]:
+    """Re-handles per 100 yard retrievals and quay crane moves, per bucket of simulated time."""
+    return await (await conn.execute(
+        """SELECT (floor(sim_t0 / %(b)s) * %(b)s)::float AS t,
+                  count(*) FILTER (WHERE kind = 'RESHUFFLE') AS rehandles,
+                  count(*) FILTER (WHERE kind = 'RETRIEVE') AS retrievals,
+                  count(*) FILTER (WHERE kind IN ('DISCHARGE', 'LOAD')) AS qc_moves
+           FROM equipment_tasks WHERE status = 'DONE' AND sim_t0 >= %(s)s
+           GROUP BY 1 ORDER BY 1""", {"b": bucket, "s": since})).fetchall()
+
+
+async def heat(conn: AsyncConnection) -> dict:
+    stacks = await (await conn.execute(
+        """SELECT origin->>'block_code' AS block, (origin->>'bay')::int AS bay, (origin->>'row')::int AS row, count(*) AS n
+           FROM equipment_tasks WHERE kind = 'RESHUFFLE' AND status = 'DONE' GROUP BY 1, 2, 3""")).fetchall()
+    reefer = await (await conn.execute(
+        """SELECT b.code AS block, count(c.id) FILTER (WHERE c.iso_type LIKE '%%R1') AS reefers
+           FROM yard_blocks b LEFT JOIN containers c ON c.block_code = b.code GROUP BY b.code ORDER BY b.code""")).fetchall()
+    return {"rehandles": stacks, "reefers": reefer}
+
+
+async def db_stats(conn: AsyncConnection) -> dict:
+    """What the database itself reports: commits, rollbacks, deadlocks, lock waits, table sizes, and the
+    heaviest statements when pg_stat_statements is installed."""
+    db = await (await conn.execute(
+        """SELECT xact_commit, xact_rollback, deadlocks, conflicts, tup_inserted, tup_updated, tup_deleted,
+                  round(100.0 * blks_hit / greatest(blks_hit + blks_read, 1), 2)::float AS cache_hit_pct
+           FROM pg_stat_database WHERE datname = current_database()""")).fetchone()
+    locks = await (await conn.execute(
+        "SELECT count(*) FILTER (WHERE NOT granted) AS waiting, count(*) AS held FROM pg_locks")).fetchone()
+    sizes = await (await conn.execute(
+        """SELECT (SELECT count(*) FROM container_history) AS history_rows,
+                  (SELECT count(*) FROM event_log) AS event_rows,
+                  (SELECT count(*) FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent
+                   WHERE p.relname IN ('container_history', 'event_log')) AS partitions,
+                  (SELECT coalesce(sum(pg_total_relation_size(i.inhrelid)), 0) FROM pg_inherits i
+                   JOIN pg_class p ON p.oid = i.inhparent
+                   WHERE p.relname IN ('container_history', 'event_log'))::bigint AS history_bytes""")).fetchone()
+    top = None
+    if await (await conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'")).fetchone():
+        try:
+            async with conn.transaction():
+                top = await (await conn.execute(
+                    r"""SELECT left(regexp_replace(query, '\s+', ' ', 'g'), 90) AS query, calls,
+                              round(total_exec_time::numeric, 1)::float AS total_ms,
+                              round(mean_exec_time::numeric, 3)::float AS mean_ms
+                       FROM pg_stat_statements
+                       WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+                       ORDER BY total_exec_time DESC LIMIT 8""")).fetchall()
+        except errors.Error:                 # installed but not in shared_preload_libraries
+            top = None
+    return {**db, **locks, **sizes, "top": top}

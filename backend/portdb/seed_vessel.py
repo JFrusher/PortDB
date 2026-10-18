@@ -61,11 +61,13 @@ def cargo(rng: random.Random, flow: str, hazmat_ok: bool = True, forty: bool | N
     """One box's commercial details. Imports carry an onward mode; exports and tranships a port of discharge."""
     forty = rng.random() < config.SHARE_40FT if forty is None else forty
     reefer = rng.random() < config.SHARE_REEFER
+    hazmat = hazmat_ok and rng.random() < config.SHARE_HAZMAT
     box = {
         "id": new_id(rng),
         "iso_type": ("45" if forty else "22") + ("R1" if reefer else "G1"),
         "weight_kg": int(rng.triangular(3800, 30480, 14000) if forty else rng.triangular(2300, 24000, 11000)),
-        "hazmat": hazmat_ok and rng.random() < config.SHARE_HAZMAT,
+        "hazmat": hazmat,
+        "imdg_class": rng.choices(list(config.IMDG_CLASSES), weights=list(config.IMDG_CLASSES.values()))[0] if hazmat else None,
         "flow": flow,
     }
     if flow == "IMPORT":
@@ -76,9 +78,9 @@ def cargo(rng: random.Random, flow: str, hazmat_ok: bool = True, forty: bool | N
     return box
 
 
-COLS = ["id", "iso_type", "weight_kg", "hazmat", "flow", "mode", "customs_hold", "pod", "state",
+COLS = ["id", "iso_type", "weight_kg", "hazmat", "imdg_class", "flow", "mode", "customs_hold", "pod", "state",
         "vessel_id", "vessel_bay", "vessel_row", "vessel_tier", "vessel_half", "block_code", "bay", "row", "tier",
-        "half", "train_id", "wagon", "wagon_slot"]
+        "half", "train_id", "wagon", "wagon_slot", "carrier_id"]
 
 
 async def insert_boxes(conn: AsyncConnection, boxes: list[dict]) -> None:
@@ -130,9 +132,11 @@ def manifest(vessel_id: int, berth: int, rng: random.Random) -> list[dict]:
 
 async def reset(conn: AsyncConnection) -> None:
     await conn.execute(
-        "TRUNCATE road_bookings, gate_transactions, equipment_tasks, containers, trains, vessels, equipment, "
+        "TRUNCATE road_bookings, gate_transactions, equipment_tasks, container_history, event_log, weather, "
+        "gate_outages, berth_windows, containers, trains, vessels, equipment, "
         "yard_slots, yard_blocks, berths, ports, terminals RESTART IDENTITY"
     )
+    await conn.execute("SELECT ensure_partitions(0, 900)")
     await conn.execute("INSERT INTO terminals (code, name) VALUES (%s, %s)",
                        (config.TERMINAL_CODE, config.TERMINAL_NAME))
     async with conn.cursor() as cur:
@@ -184,6 +188,15 @@ async def seed_yard(conn: AsyncConnection, rng: random.Random) -> int:
                                         "tier": tier, "half": half})
                     placed += 1
     await insert_boxes(conn, boxes)
+    # IMDG segregation, judged by the database's own table: of each clashing pair, the later box
+    # ships as general cargo instead
+    await conn.execute(
+        """UPDATE containers SET hazmat = false, imdg_class = NULL
+           WHERE id IN (SELECT a.id FROM containers a
+                        JOIN containers b ON a.block_code = b.block_code AND a.id > b.id
+                        JOIN imdg_segregation s ON (s.class_a, s.class_b)
+                                                 = (least(a.imdg_class, b.imdg_class), greatest(a.imdg_class, b.imdg_class))
+                        WHERE greatest(abs(a.bay - b.bay), abs(a.row - b.row)) <= s.code)""")
     return len(boxes)
 
 
@@ -198,15 +211,6 @@ async def seed_vessel(conn: AsyncConnection, rng: random.Random, berth: int = 1)
     )).fetchone()
     await insert_boxes(conn, manifest(vessel["id"], berth, rng))
     return vessel["id"]
-
-
-async def new_export_on_truck(conn: AsyncConnection, rng: random.Random, plate: str) -> dict:
-    """A lorry arriving with an export box: the box exists from the moment it reaches the gate."""
-    box = cargo(rng, "EXPORT") | {"state": "ON_TRUCK"}
-    await insert_boxes(conn, [box])
-    gate = await (await conn.execute(
-        "INSERT INTO gate_transactions (plate, container_id) VALUES (%s, %s) RETURNING id", (plate, box["id"]))).fetchone()
-    return box | {"gate_id": gate["id"]}
 
 
 async def new_inbound_rail(conn: AsyncConnection, rng: random.Random, train: int) -> list[dict]:

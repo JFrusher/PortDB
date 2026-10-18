@@ -1,6 +1,7 @@
 """The database, not Python, refuses illegal terminal states."""
 
 import asyncio
+import re
 import random
 
 import psycopg
@@ -39,7 +40,10 @@ def rejects(fragment: str):
 def test_models_match_migration(db):
     url, _ = db
     with create_engine(sqlalchemy_url(url)).connect() as c:
-        diff = compare_metadata(MigrationContext.configure(c), Base.metadata)
+        # partitions are created at run time; the parents are compared
+        ctx = MigrationContext.configure(c, opts={"include_name": lambda name, kind, _: not (
+            kind == "table" and re.search(r"_(p\d+|default)$", name or ""))})
+        diff = compare_metadata(ctx, Base.metadata)
     assert diff == []
 
 
@@ -123,7 +127,7 @@ def test_hazmat_only_in_block_c(db):
 
     async def go():
         async with await connect(url) as conn:
-            await conn.execute("UPDATE containers SET hazmat = true")
+            await conn.execute("UPDATE containers SET hazmat = true, imdg_class = '9'")
             await conn.commit()
             with rejects("hazmat_segregation"):
                 await discharge_to(conn, vessel, slot("A"))
@@ -148,8 +152,10 @@ def test_clearance_cte_lists_blockers_top_down(db):
     run(go())
 
 
-def test_allocation_builds_to_tier_3_and_avoids_own_stack(db):
+def test_allocation_builds_to_tier_3_and_avoids_own_stack(db, monkeypatch):
     url, vessel = db
+    from portdb import config
+    monkeypatch.setattr(config, "YARD_STRATEGY", "BASIC")
 
     async def go():
         async with await connect(url) as conn:
@@ -159,6 +165,9 @@ def test_allocation_builds_to_tier_3_and_avoids_own_stack(db):
                 assert await q.allocate_slot(conn, "A", True, avoid=(1, 1)) == slot(row=2, tier=1)
                 # a 20 may not join a 40 stack: it starts its own, fore half first
                 assert await q.allocate_slot(conn, "A", False) == slot(row=2, tier=1, half=1)
+                # SMART spreads the yard: ground slots first
+                monkeypatch.setattr(config, "YARD_STRATEGY", "SMART")
+                assert await q.allocate_slot(conn, "A", True) == slot(row=2, tier=1)
     run(go())
 
 
@@ -274,7 +283,7 @@ def test_shift_start_yard_obeys_every_rule(pg_url):
 async def export_in_yard(conn, rng, n, **over):
     """n export boxes on their own tier-1 slots in block D, committed."""
     boxes = [cargo(rng, "EXPORT") | {"state": "STACKED_IN_YARD", "block_code": "D", "bay": 1, "row": r, "tier": 1,
-                                     "half": 0, "hazmat": False} | over for r in range(1, n + 1)]
+                                     "half": 0, "hazmat": False, "imdg_class": None} | over for r in range(1, n + 1)]
     await insert_boxes(conn, boxes)
     await conn.commit()
     return boxes
@@ -403,8 +412,8 @@ def test_quay_cranes_cannot_pass_each_other(db):
             spans = {r["id"]: r["rail_span"] for r in await (await conn.execute(
                 "SELECT id, rail_span FROM equipment WHERE kind = 'QC' ORDER BY id")).fetchall()}
             qc1, qc2 = float(spans["QC-1"].upper), float(spans["QC-2"].lower)
-            assert await q.claim_rail(conn, "QC-1", qc1 - 1.8, qc2 + 0.5) is False   # would sweep through QC-2
-            assert await q.claim_rail(conn, "QC-1", qc1 - 1.8, qc2 - 0.1) is True    # right up to it is fine
+            assert await q.claim_rail(conn, "QC-1", qc1 - 1.8, qc2 + 0.5) == "equipment_qc_rail_no_crossing"
+            assert await q.claim_rail(conn, "QC-1", qc1 - 1.8, qc2 - 0.1) is None    # right up to it is fine
     run(go())
 
 

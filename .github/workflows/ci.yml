@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  database:
+    name: schema, rules, fuzz and simulation tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: port
+          POSTGRES_PASSWORD: port
+          POSTGRES_DB: port
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U port -d port" --health-interval 2s --health-timeout 3s --health-retries 30
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      TEST_DATABASE_URL: postgresql://port:port@localhost:5432/port
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - run: uv run python -m portdb.layout
+      - run: uv run pytest -q
+
+  diorama:
+    name: frontend typecheck and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  compose:
+    name: docker compose boots and serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build --wait
+      - name: the API answers through nginx and the sim is moving
+        run: |
+          for i in $(seq 1 60); do curl -fs localhost:8080/api/stats > stats.json && break; sleep 2; done
+          python3 -c "import json; s = json.load(open('stats.json')); print(s['t'], s['states']); assert s['t'] > 0"
+      - if: failure()
+        run: docker compose logs

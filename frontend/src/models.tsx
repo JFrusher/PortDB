@@ -1,12 +1,12 @@
 // Equipment, vehicles, ships and people. Each model is one merged, vertex-coloured geometry (one
 // draw call), plus a "detail" geometry that only mounts when the camera is zoomed in close.
 
-import { Html } from "@react-three/drei";
+import { Html, Line } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
 import { useMemo, useRef, useSyncExternalStore, type RefObject } from "react";
 import * as THREE from "three";
 import { GLASS, GLOW, MAT, Parts } from "./parts";
-import { moving, shipOffset, simNow, trackAt, useWorldSelect, world, type Layout, type V3, type Vessel } from "./world";
+import { moving, shipOffset, simNow, swayAt, trackAt, useWorldSelect, world, type Layout, type V3, type Vessel } from "./world";
 
 export const C = {
   table: "#F4F1EA",
@@ -65,16 +65,26 @@ const tmp: V3 = [0, 0, 0];
  * the quay (x), and so must whatever carries them. AGVs crab-steer, as real terminal AGVs do, and
  * lorries only ever drive east, stepping sideways into their loading spots.
  */
-export function useMover(id: string, home: V3) {
+export function useMover(id: string, home: V3, sway = false) {
   const ref = useRef<THREE.Group>(null!);
   useFrame(() => {
     const tr = world.tracks.get(id);
-    if (tr) trackAt(tr, simNow(), tmp);
+    const now = simNow();
+    if (tr) trackAt(tr, now, tmp);
     else Object.assign(tmp, home);
+    // a spreader swings under its trolley; userData.base keeps the trolley's own position
+    const base = (ref.current.userData.base ??= new THREE.Vector3()) as THREE.Vector3;
+    base.set(tmp[0], tmp[1], tmp[2]);
+    if (sway && tr) {
+      swayAt(tr, now, swing);
+      tmp[0] += swing[0];
+      tmp[2] += swing[1];
+    }
     ref.current.position.set(tmp[0], tmp[1], tmp[2]);
   });
   return ref;
 }
+const swing: [number, number] = [0, 0];
 
 function Mesh({ geo, mat = MAT, shadow = true }: { geo: THREE.BufferGeometry; mat?: THREE.Material; shadow?: boolean }) {
   return <mesh geometry={geo} material={mat} castShadow={shadow} receiveShadow={shadow} />;
@@ -106,8 +116,10 @@ export function Agv({ id, home }: { id: string; home: V3 }) {
   const detail = useDetail();
   const beacon = useRef<THREE.MeshStandardMaterial>(null!);
   useFrame(() => {
-    const on = moving(world.tracks.get(id), simNow()) && Math.sin(simNow() * 9) > 0;
+    const down = world.mode === "live" && !!world.stats?.queues.down.includes(id);
+    const on = (down || moving(world.tracks.get(id), simNow())) && Math.sin(simNow() * (down ? 5 : 9)) > 0;
     beacon.current.emissiveIntensity = on ? 2.4 : 0.1;
+    beacon.current.emissive.set(down ? "#E0503A" : C.amber);
   });
   return (
     <group ref={ref}>
@@ -263,25 +275,46 @@ function buildShip(L: Layout, x0: number, bays: number, rows: number) {
     .cone(0.1, 0.3, [xb + 1.3, h + 0.2, cz], C.steel, 6);             // forecastle mast
   for (const x of [xs + 0.4, xb - 0.2])
     detail.rod([x, h + 0.1, z0], [x + (x < x0 ? -0.6 : 0.6), 0.1, 0.2], 0.012, "#C9B79C", 4);   // mooring lines
+  // navigation lights: masthead white, port red, starboard green (bow points east, quay is to port)
   const glow = new Parts().box([0.05, 0.05, 0.05], [ax + 0.1, h + 3.35, cz], "#FFE8B0")
-    .box([0.04, 0.04, 0.04], [xb + 1.3, h + 0.4, cz], "#FFE8B0");
-  return { body: body.build(), glass: glass.build(), detail: detail.build(), glow: glow.build(), label: [ax, -0.2, z0 + 0.15] as V3 };
+    .box([0.04, 0.04, 0.04], [xb + 1.3, h + 0.4, cz], "#FFE8B0")
+    .box([0.06, 0.08, 0.04], [ax + 0.6, h + 2.2, z0 + 0.1], "#E0503A")
+    .box([0.06, 0.08, 0.04], [ax + 0.6, h + 2.2, z1 - 0.1], "#5FD38D");
+  return { body: body.build(), glass: glass.build(), detail: detail.build(), glow: glow.build(), label: [ax, -0.2, z0 + 0.15] as V3,
+           bow: [xb + 2.2, cz] as [number, number], stern: [xs - 0.2, cz] as [number, number], beam };
 }
 
 function ShipModel({ L, v }: { L: Layout; v: Vessel }) {
   const ref = useRef<THREE.Group>(null!);
   const lines = useRef<THREE.Group>(null);
+  const tugs = useRef<THREE.Group>(null!);
+  const wake = useRef<THREE.Mesh>(null!);
+  const wakeMat = useRef<THREE.MeshBasicMaterial>(null!);
   const detail = useDetail();
   const b = L.berths.find((x) => x.id === v.berth)!;
   const g = cached(`ship:${b.x0}:${v.bays}:${v.rows}`, () => buildShip(L, b.x0, v.bays, v.rows));
   useFrame(() => {
-    const dx = shipOffset(L, world.vessels.get(v.id), simNow());
+    const now = simNow();
+    const live = world.vessels.get(v.id);
+    const dx = shipOffset(L, live, now);
     ref.current.visible = dx != null;
     if (dx == null) return;
-    const t = simNow();
-    ref.current.position.set(dx, Math.sin(t * 0.9 + v.berth) * 0.025, 0);
-    ref.current.rotation.x = Math.sin(t * 0.7 + v.berth) * 0.004;
+    ref.current.position.set(dx, Math.sin(now * 0.9 + v.berth) * 0.025, 0);
+    ref.current.rotation.x = Math.sin(now * 0.7 + v.berth) * 0.004;
     if (lines.current) lines.current.visible = Math.abs(dx) < 0.01;   // mooring lines only while alongside
+    // under way: tugs at bow and stern, and a wake that grows with speed
+    const speed = Math.abs(dx - (shipOffset(L, live, now - 0.2) ?? dx)) / 0.2;
+    const underway = Math.abs(dx) > 0.01;
+    tugs.current.visible = underway;
+    if (underway) {
+      const k = Math.sin(now * 1.4) * 0.05;
+      tugs.current.children[0].position.set(g.bow[0] + 2.4, -0.12 + k, g.bow[1]);
+      tugs.current.children[1].position.set(g.stern[0] - 1.6, -0.12 - k, g.stern[1] - g.beam * 0.35);
+    }
+    wake.current.visible = speed > 0.05;
+    wake.current.scale.set(Math.min(14, 1 + speed * 1.6), 1, 1);
+    wake.current.position.x = g.stern[0] - wake.current.scale.x / 2;
+    wakeMat.current.opacity = Math.min(0.55, speed * 0.12);
   });
   return (
     <group ref={ref}>
@@ -293,12 +326,26 @@ function ShipModel({ L, v }: { L: Layout; v: Vessel }) {
           <Mesh geo={g.detail} shadow={false} />
         </group>
       )}
+      <group ref={tugs} visible={false}>
+        <mesh geometry={TUG} material={MAT} castShadow />
+        <mesh geometry={TUG} material={MAT} castShadow />
+        <Line points={[[g.bow[0] + 1.7, 0.3, g.bow[1]], [g.bow[0], L.ship_deck + 0.2, g.bow[1]]]} color="#C9B79C" lineWidth={1.5} />
+      </group>
+      {/* foam trailing astern; the plane is anchored at the stern and stretches west */}
+      <mesh ref={wake} position={[g.stern[0], -0.17, g.stern[1]]} rotation-x={-Math.PI / 2} visible={false}>
+        <planeGeometry args={[1, g.beam * 0.9]} />
+        <meshBasicMaterial ref={wakeMat} color="#FFFFFF" transparent opacity={0} depthWrite={false} />
+      </mesh>
       <Html position={g.label} center zIndexRange={[10, 0]}>
         <div className="label">{v.name.toUpperCase()}</div>
       </Html>
     </group>
   );
 }
+
+/** Harbour tug: one merged geometry, shared by every ship's escort and the one pottering about. */
+export const TUG = new Parts().box([1.4, 0.35, 0.6], [0, 0.1, 0], C.boot).box([0.6, 0.4, 0.45], [-0.15, 0.45, 0], C.ivory)
+  .cyl(0.07, 0.3, [-0.35, 0.8, 0], C.steel).box([0.2, 0.06, 0.62], [0.6, 0.3, 0], C.tyre).build();
 
 /** One ship per occupied berth; mounts when a vessel id appears, unmounts after it sails. */
 export function Ships({ L }: { L: Layout }) {
@@ -321,18 +368,20 @@ type CraneProps = { id: string; home: V3; L: Layout };
 
 /** Frame slides along x with the spreader; trolley + hoist cables follow the spreader. */
 function useGantry(id: string, home: V3, top: number, L: Layout) {
-  const spreader = useMover(id, home);
+  const spreader = useMover(id, home, true);
   const frame = useRef<THREE.Group>(null!);
   const trolley = useRef<THREE.Group>(null!);
   const cable = useRef<THREE.Mesh>(null!);
   useFrame(() => {
     const s = spreader.current.position;
-    frame.current.position.x = s.x;
-    trolley.current.position.set(s.x, top, s.z);
+    const b = (spreader.current.userData.base as THREE.Vector3 | undefined) ?? s;
+    frame.current.position.x = b.x;
+    trolley.current.position.set(b.x, top, b.z);
     const base = s.y + L.box_h + 0.06;
     const h = Math.max(top - base, 0.01);
-    cable.current.position.set(s.x, base + h / 2, s.z);
+    cable.current.position.set((s.x + b.x) / 2, base + h / 2, (s.z + b.z) / 2);
     cable.current.scale.y = h;
+    cable.current.rotation.set(Math.atan2(s.z - b.z, h), 0, -Math.atan2(s.x - b.x, h));
   });
   return { spreader, frame, trolley, cable };
 }

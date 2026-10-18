@@ -492,3 +492,47 @@ Three rules keep the order-preserving plan from ever asking a crane to pass anot
 - **Close-up detail:** at camera zoom ≥ 40, the scene mounts a second "detail" geometry per model (ladders, walkways, railings, spreader twistlocks and flippers, wheel hubs, lifeboats, mooring lines, signage) and instanced people (lashers under the QCs, yard checkers, gate clerks, customs officers, rail crew).
 - **Quality tiers:** set by `PerformanceMonitor` (or pinned with `?q=0|1|2`): flat → shadows → shadows + AO/tilt-shift.
 - **Export colours:** exports are coloured by port of discharge, so the stowage rule is visible on deck.
+
+## 11. Time travel, change feed, operating rules (migration 0005)
+
+### Simulated time inside the database
+
+`db()` runs `SELECT set_config('portdb.sim_t', <env.now at the call>, true)` first in every transaction. `sim_now()` reads it (0 when unset, as in most tests). Every time-dependent rule and every history row uses it, so the database judges "now" in simulated seconds.
+
+### History, event log, change feed
+
+| Object | Purpose |
+|---|---|
+| `container_feed` (view, `security_invoker`) | The one shape of a box: the wire, the history snapshot and `/api/snapshot`. Carrier for lorry-borne boxes comes from `gate_transactions.vehicle` |
+| `container_history (container_id, valid numrange, state, snapshot jsonb)` partitioned by `lower(valid)` | Every committed version. GiST on `valid` for "as of t", `(container_id, lower(valid))` for a box's journey, partial index on open rows |
+| `event_log (t, type, unit, body)` partitioned by `t` | Everything streamed except box changes and stats: tracks, calls, weather, refusals, chaos. BRIN on `t`, `(unit, t)` for journeys. Written by the API in 0.5 s `COPY` batches |
+| `ensure_partitions(t_from, t_to)` | Five-minute partitions for both tables; the API's maintenance task keeps ten minutes ahead. A default partition catches anything if it ever falls behind |
+| `drop_history_before(cutoff)` | Retention (`RETENTION_S`, 30 min): versions still valid at the cutoff are re-inserted starting at the cutoff, then whole partitions are dropped |
+| `trg_publish_container` (deferred) | At commit: read the row through `container_feed`; skip if identical to the open version (several updates, one publish); otherwise close the open version at `sim_now()` and insert the new one (or update in place when time hasn't moved); `pg_notify('container_feed', …)` |
+
+The API holds one dedicated `LISTEN container_feed` connection and forwards each notification 60 ms later, so a box's new position lands just after the crane track that animates it. The engine no longer sends box events at all.
+
+Replay: `GET /api/replay/seek?t=` returns boxes from `container_history` plus the latest track / vessel / train / scan / reshuffle / weather per unit from `event_log` (dropping units removed before t). `GET /api/replay/events?t0=&t1=` merges history versions and log rows in time order; the client applies them through the same `apply()` as live, on its own clock, and returns to live when it catches up.
+
+### Operating rules
+
+| Object | Rule |
+|---|---|
+| `weather`, `crane_wind_limits`, `trg_lift_rules` (BEFORE INSERT on `equipment_tasks`) | Equipment that is `DOWN` takes no task; QC / RTG / RMG lifts are refused above their wind limit at `sim_now()` |
+| `trg_rail_while_down` | A crane that is down may shrink its rail envelope but not grow it |
+| `gate_outages` (`EXCLUDE (during WITH &&)`), `trg_gate_open` | No check-in (`status → AT_LANE`) during an outage |
+| `imdg_segregation`, `trg_imdg_segregation` (deferred, advisory lock per block) | Hazardous classes keep their distance in a block: code 1 → not within 1 stack, code 2 → not within 2 |
+| `berth_windows` (`EXCLUDE (quay WITH &&, during WITH &&)`) | No two calls planned on the same quay metres at the same time |
+| `trg_count_rehandle`, `trg_stamp_yard_in` | `rehandles` and `yard_in_t` columns for the heat views |
+| Roles `portdb_customs`, `portdb_gate`, `portdb_line` + policies | Row-level security on `containers`; `/api/visible` runs the same SELECT under `SET LOCAL ROLE` |
+
+The engine's `lift(unit, step)` wraps every crane transaction: a `wind_limit` or `equipment_down` refusal is reported as a `refusal` event, the crane waits `LIFT_RETRY_S` and tries again with a fresh timestamp. Any other refusal still propagates. Rail claims, lost booking races, gate check-ins and berth-window extensions report their refusals too; the X-ray view flashes each one where it happened.
+
+### Engine additions
+
+- **Weather:** a wandering wind, a storm front every 6–9 minutes (first at t=240), fog around dawn. A reading every 4 s.
+- **Chaos:** `/api/chaos/{storm|crane|agv|gate}` and random mode. Faults are rows; repairs set them back.
+- **Berth plan:** each berth books its next call's window on arrival; `keep_window` extends an overrunning call and, when the database refuses, pushes the next call back first.
+- **Dual cycling:** during discharge a QC keeps one export on its way to a bay it has emptied and loads it between discharges at `DUAL_CYCLE_FACTOR` of a cycle. Discharge only peeks bays that still hold inbound cargo.
+- **Make way:** an idle crane steps aside when a neighbour is blocked on rail it stands on.
+- **Smart placement:** `allocate_slot(..., box=)` orders by "the box below leaves after this one" (exports by port then weight, imports by onward mode) then by tier, and filters slots by IMDG distance. `python -m portdb.bench` compares strategies.

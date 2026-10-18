@@ -1,0 +1,35 @@
+# Render blueprint: a live demo from this repo. New > Blueprint, point it at the repository.
+# The free tiers sleep when idle; the API resets the terminal on every boot, so a visit starts a fresh shift.
+databases:
+  - name: portdb-db
+    plan: free
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: portdb-api
+    runtime: docker
+    rootDir: backend
+    plan: free
+    healthCheckPath: /api/layout
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: portdb-db
+          property: connectionString
+
+  - type: web
+    name: portdb
+    runtime: docker
+    rootDir: frontend
+    plan: free
+    envVars:
+      - key: PORT          # nginx listens on 80
+        value: "80"
+      - key: API_SCHEME
+        value: https
+      - key: API_HOST
+        fromService:
+          name: portdb-api
+          type: web
+          property: host

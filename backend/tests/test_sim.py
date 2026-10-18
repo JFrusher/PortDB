@@ -39,4 +39,4 @@ def test_terminal_runs_clean(pg_url):
     assert stats["states"].get("STACKED_IN_YARD", 0) > 0
     assert sum(sim.waits.values()) > 0                                 # bookings made someone yield
     assert live <= 30                                                  # only work actually in flight is open
-    assert {"vessel", "boxes", "track", "box", "lorry", "train", "remove"} <= kinds
+    assert {"vessel", "track", "lorry", "train", "remove", "weather"} <= kinds

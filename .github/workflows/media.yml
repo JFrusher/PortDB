@@ -1,0 +1,30 @@
+name: re-record README footage
+
+# Boots the stack, drives the diorama with Playwright through scripts/capture.js, assembles the GIFs
+# and uploads them. Run by hand after visual changes; commit the artifact over docs/media.
+on:
+  workflow_dispatch:
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build --wait
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm i --no-save playwright@1.56.1 && npx playwright install --with-deps chromium
+      - run: pip install pillow
+      - run: node scripts/record.mjs
+        env:
+          PORTDB_URL: http://localhost:8080
+      - run: python scripts/make_gifs.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: readme-media
+          path: docs/media/*.gif

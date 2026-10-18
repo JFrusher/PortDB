@@ -31,6 +31,9 @@ export type Box = {
   train_id?: number | null;
   wagon?: number | null;
   wagon_slot?: number | null;
+  imdg_class?: string | null;
+  yard_in_t?: number | null;
+  rehandles?: number;
 };
 export type Block = { code: string; x0: number; z0: number; bays: number; rows: number; tiers: number; purpose: string; hazmat: boolean };
 export type Berth = { id: number; name: string; x0: number; bays: number; rows: number; tiers: number };
@@ -55,8 +58,11 @@ export type Layout = {
   rtg_clear_y: number;
   qc_clear_y: number;
   rmg_clear_y: number;
+  day: { length_s: number; start_h: number };
   units: { id: string; kind: Kind; home: V3 }[];
 };
+export type Weather = { wind: number; gust: number; rain: number; fog: number };
+export type Refusal = { rule: string; at: V3; detail: string; born: number };
 export type Vessel = {
   id: number; name: string; imo: string; berth: number; bays: number; rows: number; tiers: number;
   status: string; phase: string | null; t0: number; t1: number; manifest: number; left: number; loaded: number;
@@ -85,8 +91,18 @@ export type Stats = {
   rejects: number;
   vessels: Vessel[];
   train: Train | null;
-  queues: { agv_wait: number; rtg: Record<string, number>; gate: number; waits: Record<string, number> };
+  weather: Weather;
+  limits: Record<string, number>;
+  strategy: "BASIC" | "SMART";
+  dual: boolean;
+  chaos_auto: boolean;
+  history_from: number;
+  queues: {
+    agv_wait: number; rtg: Record<string, number>; gate: number; waits: Record<string, number>;
+    refusals: Record<string, number>; held: Record<string, string>; down: string[]; dual_cycles: number;
+  };
 };
+export type ColorBy = "line" | "port" | "weight" | "dwell" | "rehandles" | "reefer";
 
 export type Focus = "overview" | "quay" | "berth3" | "yard" | "gate" | "customs" | "rail";
 
@@ -105,6 +121,15 @@ export const world = {
   focus: "overview" as Focus,
   connected: false,
   version: 0,
+  weather: { wind: 6, gust: 7.5, rain: 0, fog: 0 } as Weather,
+  refusals: [] as Refusal[],              // recent database refusals, flashed in the X-ray view
+  xray: false,
+  colorBy: "line" as ColorBy,
+  visible: null as Set<string> | null,   // row-level security: boxes the chosen role may see
+  viewAs: "" as string,
+  journey: null as { id: string; points: V3[]; stops: V3[] } | null,
+  mode: "live" as "live" | "replay",
+  liveT: 0,                               // the live terminal's clock, kept while replaying
 };
 
 const listeners = new Set<() => void>();
@@ -201,6 +226,39 @@ export function trackAt(tr: Track, now: number, out: V3 = [0, 0, 0]): V3 {
 
 export const moving = (tr: Track | undefined, now: number) => !!tr && now >= tr.t0 && now < tr.t1;
 
+/**
+ * Spreader sway on a crane move (5-point track: down, up, across, down). The load lags as the trolley
+ * runs across, then swings past and settles as it is lowered. Crane and box tracks share timing and
+ * shape, so both get the same offset and the box stays under its spreader.
+ */
+export function swayAt(tr: Track, now: number, out: [number, number]): [number, number] {
+  out[0] = out[1] = 0;
+  if (tr.path.length !== 5 || tr.kind === "AGV" || tr.kind === "LORRY" || tr.kind === "TRAIN") return out;
+  const T = tr.t1 - tr.t0;
+  const f = T > 0 ? clamp01((now - tr.t0) / T) * 4 : 4;
+  if (f <= 2 || f >= 4) return out;
+  const a = tr.path[2];
+  const b = tr.path[3];
+  const dx = b[0] - a[0];
+  const dz = b[2] - a[2];
+  const len = Math.hypot(dx, dz);
+  if (len < 0.01) return out;
+  const amp = Math.min(0.14, 0.025 * len);
+  const s = f < 3 ? -Math.sin(Math.PI * (f - 2)) * amp : Math.sin(Math.PI * 3 * (f - 3)) * Math.exp(-4 * (f - 3)) * amp * 0.6;
+  out[0] = (dx / len) * s;
+  out[1] = (dz / len) * s;
+  return out;
+}
+
+/** Hour of the simulated day and how much daylight there is (0 night .. 1 noon). */
+export function daylight(L: Layout, t: number): { hour: number; sun: number; day: number } {
+  const hour = (L.day.start_h + (24 * t) / L.day.length_s) % 24;
+  // a long northern summer day: sun up 05:00-21:00, so night is a third of the cycle
+  const sun = hour >= 5 && hour <= 21 ? Math.sin(((hour - 5) / 16) * Math.PI) : -Math.sin((((hour + 3) % 24) / 8) * Math.PI);
+  const u = clamp01((sun + 0.15) / 0.45);
+  return { hour, sun, day: u * u * (3 - 2 * u) };
+}
+
 // --- geometry -----------------------------------------------------------------------------
 export function berthOf(L: Layout, id: number): Berth {
   return L.berths.find((b) => b.id === id)!;
@@ -243,12 +301,19 @@ export function trainAt(L: Layout, trainId: number, now: number, out: V3): V3 {
 }
 
 const tmpT: V3 = [0, 0, 0];
+const tmpSway: [number, number] = [0, 0];
 const ON_SHIP = new Set(["STOWED_ON_BOARD", "DISCHARGING", "LOADING", "SAILED"]);
 
 /** Where a box is drawn (bottom centre). */
 export function boxPos(L: Layout, b: Box, now: number, out: V3): V3 | null {
   const own = world.tracks.get(b.id);
-  if (own && now < own.t1) return trackAt(own, now, out); // mid-crane
+  if (own && now < own.t1) {
+    trackAt(own, now, out); // mid-crane, swinging with the spreader
+    swayAt(own, now, tmpSway);
+    out[0] += tmpSway[0];
+    out[2] += tmpSway[1];
+    return out;
+  }
 
   if (b.carrier_id && (b.state === "IN_TRANSIT" || b.state === "ON_TRUCK" || b.state === "GATE_OUT")) {
     const carrier = world.tracks.get(b.carrier_id);
@@ -295,9 +360,42 @@ function log(t: number, text: string, level: Level = "info") {
   if (world.log.length > 80) world.log.shift();
 }
 
+const GONE = new Set(["SAILED", "RAIL_OUT", "GATE_OUT"]);
+
+/** A box version from the database's change feed (or the history, in replay). Logs what changed. */
+function applyBox(ev: any) {
+  const { type: _type, t, ...row } = ev;
+  const prev = world.boxes.get(row.id);
+  if (!prev && GONE.has(row.state)) return; // late news of a box that already left
+  const b = { ...prev, ...row } as Box;
+  world.boxes.set(b.id, b);
+  if (!prev || prev.state === b.state) {
+    if (prev && b.block_code && (prev.bay !== b.bay || prev.row !== b.row || prev.tier !== b.tier)) log(t, `SHIFT     ${b.id} → ${fmtSlot(b)}`);
+    else if (prev && b.inspected && !prev.inspected) log(t, `CLEARED   ${b.id} released by customs`, "customs");
+    return;
+  }
+  if (b.state === "STACKED_IN_YARD") log(t, `STACK     ${b.id} → ${fmtSlot(b)}`, b.flow === "IMPORT" ? "info" : "export");
+  else if (b.state === "ON_TRUCK" && prev.state === "RETRIEVING") log(t, `TRUCK     ${b.id} on ${b.carrier_id}`);
+  else if (b.state === "ON_RAIL" && prev.state === "IN_TRANSIT") log(t, `WAGON     ${b.id} → W${b.wagon}/${b.wagon_slot}`, "rail");
+  else if (b.state === "STOWED_ON_BOARD" && prev.state === "LOADING") log(t, `LOADED    ${b.id} ${b.pod ?? ""} T${b.vessel_tier}`, "export");
+  else if (b.state === "GATE_OUT") log(t, `GATE OUT  ${b.id} on ${b.carrier_id}`);
+}
+
 function setVessel(v: Vessel) {
   if (v.status === "DEPARTED") world.vessels.delete(v.id);
   else world.vessels.set(v.id, v);
+}
+
+function hydrate(ev: any) {
+  world.boxes = new Map(ev.boxes.map((b: Box) => [b.id, b]));
+  world.tracks = new Map(ev.tracks.map((t: Track) => [t.id, t]));
+  world.lorries = new Set(ev.tracks.filter((t: Track) => t.kind === "LORRY").map((t: Track) => t.id));
+  world.reshuffling = new Map(ev.reshuffling.map((r: Reshuffle) => [r.block, r]));
+  world.scans = new Map(ev.scans.map((s: Scan) => [s.id, s]));
+  world.vessels = new Map(ev.vessels.map((v: Vessel) => [v.id, v]));
+  world.train = ev.train;
+  if (ev.weather) world.weather = ev.weather;
+  world.refusals = [];
 }
 
 // The server's event frames, as parsed JSON: shapes documented in BACKBONE.md section 5.
@@ -305,35 +403,30 @@ function apply(ev: any) {
   switch (ev.type) {
     case "hello":
       world.layout = ev.layout;
-      world.boxes = new Map(ev.boxes.map((b: Box) => [b.id, b]));
-      world.tracks = new Map(ev.tracks.map((t: Track) => [t.id, t]));
-      world.lorries = new Set(ev.tracks.filter((t: Track) => t.kind === "LORRY").map((t: Track) => t.id));
-      world.reshuffling = new Map(ev.reshuffling.map((r: Reshuffle) => [r.block, r]));
-      world.scans = new Map(ev.scans.map((s: Scan) => [s.id, s]));
-      world.vessels = new Map(ev.vessels.map((v: Vessel) => [v.id, v]));
-      world.train = ev.train;
+      hydrate(ev);
       world.clock = { t: ev.sim.t, at: performance.now(), speed: ev.sim.speed, paused: ev.sim.paused };
+      world.liveT = ev.sim.t;
       break;
     case "track":
       world.tracks.set(ev.id, ev);
       if (ev.kind === "LORRY") world.lorries.add(ev.id);
       return; // motion only: no HUD change
-    case "boxes":
-      for (const b of ev.boxes) world.boxes.set(b.id, b);
+    case "box":
+      applyBox(ev);
       break;
-    case "box": {
-      const { type: _type, t: _t, ...fields } = ev;
-      const b = { ...world.boxes.get(ev.id), ...fields } as Box;
-      world.boxes.set(b.id, b);
-      if (ev.state === "STACKED_IN_YARD" && ev.block_code) log(ev.t, `STACK     ${b.id} → ${fmtSlot(b)}`, b.flow === "IMPORT" ? "info" : "export");
-      else if (ev.block_code) log(ev.t, `SHIFT     ${b.id} → ${fmtSlot(b)}`);
-      else if (ev.state === "ON_TRUCK") log(ev.t, `TRUCK     ${b.id} on ${ev.carrier_id}`);
-      else if (ev.state === "ON_RAIL") log(ev.t, `WAGON     ${b.id} → W${ev.wagon}/${ev.wagon_slot}`, "rail");
-      else if (ev.state === "STOWED_ON_BOARD") log(ev.t, `LOADED    ${b.id} ${b.pod ?? ""} T${b.vessel_tier}`, "export");
-      else if (ev.state === "GATE_OUT") log(ev.t, `GATE OUT  ${b.id} on ${ev.carrier_id}`);
-      else if (ev.inspected) log(ev.t, `CLEARED   ${b.id} released by customs`, "customs");
+    case "weather":
+      world.weather = ev;
+      return;
+    case "refusal":
+      world.refusals.push({ rule: ev.rule, at: ev.at, detail: ev.detail, born: performance.now() });
+      if (world.refusals.length > 40) world.refusals.shift();
+      return;
+    case "chaos":
+      log(ev.t, `${ev.what === "repaired" ? "REPAIRED " : "CHAOS    "} ${ev.detail}`, ev.what === "repaired" ? "info" : "warn");
       break;
-    }
+    case "strategy":
+      log(ev.t, `YARD      placement strategy → ${ev.name}`);
+      break;
     case "remove":
       for (const id of ev.ids) {
         world.boxes.delete(id);
@@ -368,28 +461,137 @@ function apply(ev: any) {
       break;
     case "stats":
       world.stats = ev;
+      world.weather = ev.weather;
       for (const v of ev.vessels) setVessel(v);
       world.train = ev.train;
+      world.liveT = ev.t;
       syncClock(ev.t, ev.speed, ev.paused);
       break;
   }
   changed();
 }
 
+let socket: WebSocket | null = null;
 export function connect() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  socket = ws;
   ws.onopen = () => {
     world.connected = true;
     changed();
   };
-  ws.onmessage = (m) => apply(JSON.parse(m.data));
+  ws.onmessage = (m) => {
+    const ev = JSON.parse(m.data);
+    if (world.mode === "live") apply(ev);
+    else if (ev.type === "stats") {
+      world.liveT = ev.t; // replaying: only keep track of where "now" is
+      world.stats = ev;
+      changed();
+    }
+  };
   ws.onclose = () => {
     world.connected = false;
     changed();
-    setTimeout(connect, 1500);
+    if (socket === ws) setTimeout(connect, 1500);
   };
+}
+
+// --- time travel --------------------------------------------------------------------------
+// Seek: the server answers "where was everything at t" from container_history + the event log.
+// Play: events after t are fetched in 10 s pages and applied through the same apply() as live.
+const replay = { queue: [] as any[], fetchedTo: 0, busy: false, timer: 0 as unknown as ReturnType<typeof setInterval>, gen: 0 };
+
+export async function seek(t: number) {
+  const gen = ++replay.gen;
+  const s = await (await fetch(`/api/replay/seek?t=${t.toFixed(3)}`)).json();
+  if (gen !== replay.gen) return; // a later seek won
+  world.mode = "replay";
+  hydrate(s);
+  world.log = [];
+  world.journey = null;
+  world.clock = { t: s.sim.t, at: performance.now(), speed: world.clock.speed || 1, paused: false };
+  replay.queue = [];
+  replay.fetchedTo = s.sim.t;
+  clearInterval(replay.timer);
+  replay.timer = setInterval(pump, 100);
+  changed();
+}
+
+async function pump() {
+  const now = simNow();
+  if (now >= world.liveT - 0.5) return goLive();
+  if (!replay.busy && replay.fetchedTo < now + 8 && replay.fetchedTo < world.liveT) {
+    replay.busy = true;
+    const gen = replay.gen;
+    const t0 = replay.fetchedTo;
+    const t1 = Math.min(t0 + 10, world.liveT);
+    try {
+      const evs = await (await fetch(`/api/replay/events?t0=${t0.toFixed(3)}&t1=${t1.toFixed(3)}`)).json();
+      if (gen === replay.gen) {
+        replay.queue.push(...evs);
+        replay.fetchedTo = t1;
+      }
+    } finally {
+      replay.busy = false;
+    }
+  }
+  let n = 0;
+  while (replay.queue.length && replay.queue[0].t <= now) {
+    apply(replay.queue.shift());
+    n++;
+  }
+  if (n) changed();
+}
+
+export function setReplayClock(patch: Partial<typeof world.clock>) {
+  world.clock = { ...world.clock, t: simNow(), at: performance.now(), ...patch };
+  changed();
+}
+
+export function goLive() {
+  replay.gen++;
+  clearInterval(replay.timer);
+  world.mode = "live";
+  world.log = [];
+  socket?.close(); // reconnect at once: the hello frame brings the live terminal back
+  socket = null;
+  connect();
+  changed();
+}
+
+// --- side views ---------------------------------------------------------------------------
+/** The route a box took: every crane and vehicle move that carried it, from the event log. */
+export async function loadJourney(id: string) {
+  const j = await (await fetch(`/api/containers/${id}/journey`)).json();
+  const points: V3[] = [];
+  for (const m of j.moves) for (const p of m.path ?? []) points.push([p[0], p[1] + 0.3, p[2]]);
+  const stops: V3[] = j.moves.length ? [points[0], points[points.length - 1]] : [];
+  world.journey = { id, points, stops };
+  changed();
+  return j as { stops: { t0: number; t1: number | null; state: string; snapshot: Box }[] };
+}
+
+let visTimer: ReturnType<typeof setInterval> | undefined;
+/** Row-level security preview: ask which boxes a role may see, and grey out the rest. */
+export function setViewAs(v: string) {
+  world.viewAs = v;
+  clearInterval(visTimer);
+  world.visible = null;
+  if (v) {
+    const [role, line] = v.split(":");
+    const load = async () => {
+      const r = await (await fetch(`/api/visible?as=${role}${line ? `&line=${line}` : ""}`)).json();
+      world.visible = new Set(r.ids);
+      changed();
+    };
+    load();
+    visTimer = setInterval(load, 2000);
+  }
+  changed();
 }
 
 export async function post(path: string) {
   await fetch(path, { method: "POST" });
 }
+
+// a handle for the browser console and the footage recorder (scripts/capture.js)
+Object.assign(window, { portdb: { world, replay, seek, goLive, simNow } });

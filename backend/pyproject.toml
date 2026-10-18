@@ -13,7 +13,11 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8", "pgserver>=0.1.4"]
+dev = [
+    "pytest>=8",
+    "pgserver>=0.1.4",
+    "hypothesis>=6.170.1",
+]
 
 [tool.uv]
 package = false

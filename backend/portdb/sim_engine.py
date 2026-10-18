@@ -13,6 +13,11 @@ Container flows:
 
 Collision avoidance: AGVs and lorries book (road cell, sim-time) rectangles before they move
 (road_bookings, EXCLUDE USING gist). QCs and RMGs claim rail envelopes (numrange exclusion).
+
+Every transaction carries the simulated second it acts at (portdb.sim_t), so the database can judge
+time-dependent rules itself: no crane lifts above its wind limit, nothing that is down takes work, no
+lorry checks in during a gate outage. Box state reaches the browser from the database's change feed
+(pg_notify at commit), not from here: this module only streams motion and calls.
 """
 
 import asyncio
@@ -34,6 +39,14 @@ TICK_S = 0.02
 SPEED = {"AGV": config.AGV_NODES_PER_S, "LORRY": config.LORRY_SPEED}
 QCS = [f"QC-{i}" for i in range(1, config.QC_COUNT + 1)]
 RMGS = list(L.rmg_wagons())
+HOMES = {u["id"]: u["home"] for u in L.units()}
+HELD_BY = ("wind_limit", "equipment_down")
+
+
+def constraint_of(e: Exception) -> str:
+    """Which rule refused a transaction: the constraint's name, or the tag our triggers lead with."""
+    diag = getattr(e, "diag", None)
+    return (diag and diag.constraint_name) or str(e).split(":", 1)[0].strip()
 
 
 def loc(r: dict) -> dict:
@@ -84,9 +97,10 @@ async def tx_handover(conn, qc, box, agv, t):
 
 
 async def tx_stack(conn, box, forty, block, agv, task, t0, t1):
-    s = await q.allocate_slot(conn, block, forty)
+    """None if no slot is free for this box yet (full, or IMDG distance rules them all out)."""
+    s = await q.allocate_slot(conn, block, forty, box=box)
     if s is None:
-        raise RuntimeError(f"no_slot: block {block} full")
+        return None
     await q.move_to_slot(conn, box, s, "STACKED_IN_YARD")
     await q.close_task(conn, task, t0)
     await q.log_task(conn, f"RTG-{block}", box, "STACK", {"agv": agv}, s, t0, t1)
@@ -94,7 +108,8 @@ async def tx_stack(conn, box, forty, block, agv, task, t0, t1):
 
 
 async def tx_reshuffle(conn, blocker, t0, t1):
-    s = await q.allocate_slot(conn, blocker["block_code"], blocker["half"] == 0, avoid=(blocker["bay"], blocker["row"]))
+    s = await q.allocate_slot(conn, blocker["block_code"], blocker["half"] == 0, avoid=(blocker["bay"], blocker["row"]),
+                              box=blocker["id"])
     if s is None:
         raise RuntimeError(f"no_slot: nowhere to put blocker {blocker['id']}")
     await q.move_to_slot(conn, blocker["id"], s)
@@ -109,9 +124,9 @@ async def tx_load_truck(conn, target, gate, lorry, moves, t0, t1):
 
 
 async def tx_drop_from_truck(conn, box, forty, block, gate, lorry, t0, t1):
-    s = await q.allocate_slot(conn, block, forty)
+    s = await q.allocate_slot(conn, block, forty, box=box)
     if s is None:
-        raise RuntimeError(f"no_slot: export block {block} full")
+        return None
     await q.move_to_slot(conn, box, s, "STACKED_IN_YARD")
     await q.log_task(conn, f"RTG-{block}", box, "DROP", {"lorry": lorry}, s, t0, t1)
     await q.gate_update(conn, gate, status="LOADED")
@@ -140,13 +155,15 @@ async def tx_unload_wagon(conn, rmg, box, agv, block, train, wagon, wagon_slot, 
     return await q.open_task(conn, agv, box["id"], "TRANSPORT", {"rmg": rmg}, {"block": block}, t0)
 
 
-async def tx_load_vessel(conn, box, vessel, bay, row, tier, half):
+async def tx_load_vessel(conn, qc, box, vessel, bay, row, tier, half, agv, t0):
     await q.load_on_vessel(conn, box, vessel, bay, row, tier, half)
+    cell = {"vessel": vessel, "bay": bay, "row": row, "tier": tier, "half": half}
+    return await q.open_task(conn, qc, box, "LOAD", {"agv": agv}, cell, t0)
 
 
-async def tx_stow(conn, qc, box, agv, cell, t0, t1):
+async def tx_stow(conn, box, task, t1):
     await q.stow(conn, box)
-    await q.log_task(conn, qc, box, "LOAD", {"agv": agv}, cell, t0, t1)
+    await q.close_task(conn, task, t1)
 
 
 async def tx_gate_out(conn, box, gate):
@@ -155,7 +172,7 @@ async def tx_gate_out(conn, box, gate):
     await q.gate_depart(conn, gate)
 
 
-async def tx_export_arrival(conn, rng, plate):
+async def tx_export_arrival(conn, rng, plate, lorry):
     """A lorry turns up with an export box. Turned away (None) if the export yard is full."""
     box = cargo(rng, "EXPORT")
     block = await q.choose_block(conn, box["hazmat"], "EXPORT")
@@ -163,7 +180,8 @@ async def tx_export_arrival(conn, rng, plate):
         return None
     await insert_boxes(conn, [box | {"state": "ON_TRUCK"}])
     gate = await (await conn.execute(
-        "INSERT INTO gate_transactions (plate, container_id) VALUES (%s, %s) RETURNING id", (plate, box["id"]))).fetchone()
+        "INSERT INTO gate_transactions (plate, vehicle, container_id) VALUES (%s, %s, %s) RETURNING id",
+        (plate, lorry, box["id"]))).fetchone()
     return box | {"state": "ON_TRUCK", "dest_block": block, "gate_id": gate["id"]}
 
 
@@ -194,27 +212,39 @@ class Terminal:
         self.realloc_pending = False
         self.plans: dict[str, deque] = {qc: deque() for qc in QCS}
         self.loading: dict[str, bool] = dict.fromkeys(QCS, False)   # a popped step still in the crane's hands
+        self.planning: set[str] = set()           # cranes waiting on the load planner's query
         self.train: dict | None = None
         self.reshuffling: dict[str, dict] = {}
         self.scans: dict[str, dict] = {}
-        self.riding: dict[str, str] = {}          # box -> lorry (lorries are not equipment rows)
         self.gate_queue: list[str] = []
         self.spots_taken: set = set()
         self.idle_on_spur: set[str] = set()
         self.stuck: dict[str, tuple] = {}              # vehicle -> what it is waiting for (diagnostics)
         self.blocked: dict[str, tuple] = {}            # crane -> (at, wants) while a neighbour is in the way
         self.waits = Counter()                    # how often vehicles / cranes had to yield to someone
+        self.refusals = Counter()                 # database refusals by rule: the engine asked, the DB said no
+        self.held: dict[str, str] = {}            # crane -> rule holding it right now
+        self.down: set[str] = set()               # equipment out of service
+        self.chaos_auto = False
+        self.force_storm = False
+        self.weather_now = {"wind": 6.0, "gust": 7.5, "rain": 0.0, "fog": 0.0}
+        self.dual = config.DUAL_CYCLE
+        self.dual_cycles = 0
+        self.strategy_log = [(0.0, config.YARD_STRATEGY)]
         self.rejects = 0
         self._jobs: set[asyncio.Task] = set()
 
     # bridge ------------------------------------------------------------------------------------
     def db(self, fn, *args, **kwargs) -> simpy.Event:
         ev = self.env.event()
+        t = self.env.now
 
         async def job():
             for attempt in range(4):
                 try:
                     async with self.pool.connection() as conn:
+                        # the simulated moment this transaction acts at, for time-dependent rules and history
+                        await conn.execute("SELECT set_config('portdb.sim_t', %s, true)", (repr(t),))
                         result = await fn(conn, *args, **kwargs)
                 except (errors.DeadlockDetected, errors.SerializationFailure) as e:
                     if attempt < 3:                    # the victim of a lock cycle: its whole step rolled back, retry
@@ -249,10 +279,40 @@ class Terminal:
         log.warning("rejected: %s %s", e, " ".join(getattr(e, "__notes__", [])))
         self.send("reject", error=str(e).splitlines()[0])
 
+    def refused(self, rule: str, at, detail: str = "") -> None:
+        """The database said no. Counted per rule, and flashed where it happened in the X-ray view."""
+        self.refusals[rule] += 1
+        self.send("refusal", rule=rule, at=[round(c, 2) for c in at], detail=detail[:160])
+
+    def unit_point(self, unit: str):
+        tr = self.tracks.get(unit)
+        return tuple(tr["path"][-1]) if tr else tuple(HOMES.get(unit, (0, 0, 0)))
+
+    def lift(self, unit: str, step):
+        """A crane step, `step(t)` -> db event. The database refuses lifts above the wind limit and work
+        for equipment that is down; the crane holds and asks again. Other refusals propagate."""
+        while True:
+            try:
+                result = yield step(self.env.now)
+            except errors.CheckViolation as e:
+                rule = constraint_of(e)
+                if rule not in HELD_BY:
+                    raise
+                self.held[unit] = rule
+                self.refused(rule, self.unit_point(unit), str(e).splitlines()[0])
+                yield self.env.timeout(config.LIFT_RETRY_S)
+                continue
+            self.held.pop(unit, None)
+            return result
+
     async def run(self, until: float | None = None) -> None:
         async with self.pool.connection() as conn:
             for agv, (x, z) in self.at.items():
                 await q.park(conn, agv, x, z, 0.0)
+            w = self.weather_now
+            await q.add_weather(conn, 0.0, w["wind"], w["gust"], w["rain"], w["fog"])
+        self.spawn(self.weather())
+        self.spawn(self.chaos_loop())
         for b in config.BERTHS:
             self.spawn(self.berth(b))
         for qc in QCS:
@@ -285,7 +345,6 @@ class Terminal:
     def remove(self, *ids: str) -> None:
         for i in ids:
             self.tracks.pop(i, None)
-            self.riding.pop(i, None)
         self.send("remove", ids=list(ids))
 
     def vessel_view(self, v: dict) -> dict:
@@ -297,7 +356,9 @@ class Terminal:
         return {"agv_wait": len(self.agv_gate.get_queue),
                 "rtg": {b: len(r.queue) for b, r in self.rtg.items()},
                 "gate": len(self.gate_queue),
-                "waits": dict(self.waits)}
+                "waits": dict(self.waits),
+                "refusals": dict(self.refusals),
+                "held": self.held, "down": sorted(self.down), "dual_cycles": self.dual_cycles}
 
     # movement: booked routes -------------------------------------------------------------------
     def legs_for(self, kind: str, cells: list, depart: float, dwell: dict, park_end: bool):
@@ -351,6 +412,8 @@ class Terminal:
                 if (yield self.db(q.book_route, unit, legs, depart)):
                     break
                 self.waits["race"] += 1                  # someone booked between our check and insert
+                self.refused("road_bookings_no_overlap", L.point(route[min(1, len(route) - 1)]),
+                             f"{unit}: another vehicle booked the same cell first")
                 continue
             tries += 1
             self.waits[kind.lower()] += 1
@@ -403,8 +466,9 @@ class Terminal:
         if abs(cur - x) < 1e-3:
             return True
         half = L.QC_HALF_WIDTH if crane.startswith("QC") else L.RMG_HALF_WIDTH
-        while not (yield self.db(q.claim_rail, crane, min(cur, x) - half, max(cur, x) + half)):
+        while rule := (yield self.db(q.claim_rail, crane, min(cur, x) - half, max(cur, x) + half)):
             self.waits["crane"] += 1
+            self.refused(rule, self.unit_point(crane), f"{crane} wants x={x:.1f}")
             self.blocked[crane] = (cur, x)
             if job != "any" and self.assign.get(crane) != job:
                 self.blocked.pop(crane, None)
@@ -467,14 +531,19 @@ class Terminal:
         try:
             yield from self.travel(agv, "AGV", goals=near(L.block_spurs(block), self.at[agv][0]))
             spur = self.at[agv]
-            with self.rtg[block].request() as turn:
-                yield turn
-                t0 = self.env.now
-                s = yield self.db(tx_stack, box, forty, block, agv, task, t0, t0 + config.RTG_MOVE_S)
-                self.crane(f"RTG-{block}", "RTG", box, L.point(spur, L.AGV_BED_Y), slot_point(s), L.RTG_CLEAR_Y,
-                           config.RTG_MOVE_S)
-                self.send("box", id=box, state="STACKED_IN_YARD", carrier_id=None, **s)
-                yield self.env.timeout(config.RTG_MOVE_S)
+            rtg = f"RTG-{block}"
+            while True:
+                with self.rtg[block].request() as turn:
+                    yield turn
+                    s = yield from self.lift(rtg, lambda t: self.db(tx_stack, box, forty, block, agv, task, t,
+                                                                    t + config.RTG_MOVE_S))
+                    if s:
+                        self.crane(rtg, "RTG", box, L.point(spur, L.AGV_BED_Y), slot_point(s), L.RTG_CLEAR_Y,
+                                   config.RTG_MOVE_S)
+                        yield self.env.timeout(config.RTG_MOVE_S)
+                        break
+                self.waits["no_slot"] += 1                # nothing free for this box yet: let the RTG work on
+                yield self.env.timeout(2.0)
         except Exception as e:
             yield from self.rescue(agv, e)
             return
@@ -486,11 +555,10 @@ class Terminal:
         with self.rtg[block].request() as turn:
             yield turn
             target, _ = yield from self.dig_out(block, box)
-            t0 = self.env.now
-            yield self.db(tx_load_agv_from_yard, target, agv, t0, t0 + config.RTG_MOVE_S)
+            yield from self.lift(f"RTG-{block}", lambda t: self.db(tx_load_agv_from_yard, target, agv, t,
+                                                                   t + config.RTG_MOVE_S))
             self.crane(f"RTG-{block}", "RTG", box, slot_point(target), L.point(spur, L.AGV_BED_Y),
                        L.RTG_CLEAR_Y, config.RTG_MOVE_S)
-            self.send("box", id=box, state="IN_TRANSIT", carrier_id=agv)
             yield self.env.timeout(config.RTG_MOVE_S)
 
     # shared steps ------------------------------------------------------------------------------
@@ -502,10 +570,8 @@ class Terminal:
             self.reshuffling[block] = {"block": block, "target": box, "moves": len(blockers)}
             self.send("reshuffle", active=True, **self.reshuffling[block])
         for b in blockers:
-            t0 = self.env.now
-            s = yield self.db(tx_reshuffle, b, t0, t0 + config.RTG_MOVE_S)
+            s = yield from self.lift(f"RTG-{block}", lambda t: self.db(tx_reshuffle, b, t, t + config.RTG_MOVE_S))
             self.crane(f"RTG-{block}", "RTG", b["id"], slot_point(b), slot_point(s), L.RTG_CLEAR_Y, config.RTG_MOVE_S)
-            self.send("box", id=b["id"], **s)
             yield self.env.timeout(config.RTG_MOVE_S)
         if blockers:
             self.send("reshuffle", active=False, **self.reshuffling.pop(block))
@@ -519,7 +585,6 @@ class Terminal:
         yield self.env.timeout(config.INSPECT_S)
         yield self.db(tx_inspect, scanner, box, t0, self.env.now)
         self.scans.pop(scanner, None)
-        self.send("box", id=box, inspected=True)
 
     # quay: crane allocation --------------------------------------------------------------------
     def work_bays(self, v: dict) -> list[int]:
@@ -556,8 +621,8 @@ class Terminal:
         if new == self.assign:
             self.realloc_pending = False
             return
-        if any(self.plans.values()) or any(self.loading.values()):
-            # boxes are already on their way to some cranes: let those pipelines drain first
+        if any(self.plans.values()) or any(self.loading.values()) or self.planning:
+            # boxes are already on their way to some cranes (or about to be): let those pipelines drain first
             self.realloc_pending = True
             return
         self.realloc_pending = False
@@ -565,18 +630,52 @@ class Terminal:
         fired, self.reassigned = self.reassigned, self.env.event()
         fired.succeed()
 
+    def make_way(self, qc: str):
+        """A crane with nothing to do steps aside when a neighbour is held up wanting rail it stands on.
+        If this crane is boxed in too, its own neighbour sees it blocked and steps aside in turn."""
+        me = self.crane_x[qc]
+        reach = 2 * L.QC_HALF_WIDTH + 0.1
+        for other, (cur, want) in list(self.blocked.items()):
+            if other == qc or not other.startswith("QC") or not min(cur, want) - reach < me < max(cur, want) + reach:
+                continue
+            away = max(me, want + reach) if want > cur else min(me, want - reach)
+            if abs(away - me) > 1e-3:
+                yield from self.gantry(qc, max(-4.0, min(50.0, away)), job=self.assign[qc])
+                return True
+        return False
+
+    def idle(self, qc: str, job):
+        """Wait up to 5 s for a new assignment, making way for neighbours meanwhile."""
+        until = self.env.now + 5
+        while self.assign[qc] == job and self.env.now < until:
+            if not (yield from self.make_way(qc)):
+                yield self.reassigned | self.env.timeout(0.5)
+
+    def plan(self, qc: str, v: dict, bays: list[int]):
+        """plan_step, with the crane marked as planning: reassigning it mid-query would leave the step
+        it returns pointing at the old berth, possibly through its neighbours."""
+        self.planning.add(qc)
+        try:
+            return (yield from self.plan_step(qc, v, bays))
+        finally:
+            self.planning.discard(qc)
+
     def qc_worker(self, qc: str):
         while True:
+            if self.realloc_pending and not (any(self.plans.values()) or any(self.loading.values()) or self.planning):
+                self.reallocate()                         # the last pipeline drained: apply the deferred plan
             job = self.assign[qc]
             v = self.vessels.get(job[0]) if job else None
             if not v or v["phase"] not in ("DISCHARGE", "LOAD"):
                 if job is None and qc in self.idle_x:
                     yield from self.gantry(qc, self.idle_x[qc], job=None)
-                if self.assign[qc] == job:
-                    yield self.reassigned | self.env.timeout(5)
+                yield from self.idle(qc, job)
                 continue
             try:
-                did = yield from (self.qc_discharge if v["phase"] == "DISCHARGE" else self.qc_load)(qc, v, job)
+                if v["phase"] == "DISCHARGE":
+                    did = yield from (self.qc_dual if self.dual else self.qc_discharge)(qc, v, job)
+                else:
+                    did = yield from self.qc_load(qc, v, job)
             except Exception as e:
                 self.reject(e)
                 did = True
@@ -587,23 +686,22 @@ class Terminal:
                 v["exhausted"].add(qc)
                 self.check_load_done(v)
             self.reallocate()
-            if self.assign[qc] == job:
-                yield self.reassigned | self.env.timeout(5)
+            yield from self.idle(qc, job)
 
     # quay: discharge ---------------------------------------------------------------------------
     def qc_discharge(self, qc: str, v: dict, job: tuple):
-        bays = job[1]
-        bay = yield self.db(q.peek_next_bay, v["id"], bays[0], bays[-1])
+        bays = [b for b in job[1] if v["bay_left"][b] > 0]
+        bay = (yield self.db(q.peek_next_bay, v["id"], bays)) if bays else None
         if bay is None:
             return False
         spur = L.qc_spur(v["berth"], bay)
         if self.assign[qc] != job or not (yield from self.gantry(qc, spur[0], job=job)):
             return True                                   # reassigned while waiting for the rail: start over
-        box = yield self.db(tx_claim, qc, v["id"], bay, bay, self.env.now)
+        box = yield from self.lift(qc, lambda t: self.db(tx_claim, qc, v["id"], bay, bay, t))
         if not box:
             return True
         v["bay_left"][bay] -= 1
-        self.send("box", id=box["id"], state="DISCHARGING")
+        v["bay_busy"][bay] += 1
         agv = yield from self.claim_agv(spur)
         arrived = self.env.process(self.travel(agv, "AGV", goals=[spur]))
         cycle = self.rng.uniform(*config.QC_CYCLE)
@@ -617,12 +715,41 @@ class Terminal:
         while not (handed := (yield self.db(tx_handover, qc, box, agv, self.env.now))):
             yield self.env.timeout(1)                     # every eligible block at capacity: hold the box
         block, task = handed
-        self.send("box", id=box["id"], state="IN_TRANSIT", carrier_id=agv)
+        v["bay_busy"][bay] -= 1
         self.spawn(self.agv_to_stack(agv, box["id"], is_forty(box), block, task))
         v["left"] -= 1
         if v["left"] == 0 and not v["phase_done"].triggered:
             v["phase_done"].succeed()
         return True
+
+    def qc_dual(self, qc: str, v: dict, job: tuple):
+        """Dual cycling: while a vessel still has imports aboard, a QC also loads exports into bays it has
+        already emptied, so the trolley carries a box both ways instead of running back empty. One
+        export at a time is kept on its way, and it goes straight to the spur."""
+        plan = self.plans[qc]
+        emptied = [b for b in job[1] if v["bay_left"][b] == 0 and v["bay_busy"][b] == 0]
+        if emptied and not plan and not self.realloc_pending:
+            step = yield from self.plan(qc, v, emptied)
+            if step:
+                step["turn"].succeed()
+                plan.append(step)
+                self.spawn(self.fetch_export(v, step))
+        if plan and plan[0]["arrived"].triggered:
+            yield from self.dual_load(qc, v, plan)
+        did = yield from self.qc_discharge(qc, v, job)
+        if not did and plan:                              # our bays are empty but an export is on its way
+            yield from self.dual_load(qc, v, plan)
+            return True
+        return did
+
+    def dual_load(self, qc: str, v: dict, plan: deque):
+        step = plan.popleft()
+        self.loading[qc] = True
+        try:
+            yield from self.load_step(qc, v, step, plan, dual=True)
+            self.dual_cycles += 1
+        finally:
+            self.loading[qc] = False
 
     # quay: load --------------------------------------------------------------------------------
     def columns(self, v: dict, stack: tuple) -> list[int]:
@@ -671,7 +798,7 @@ class Terminal:
         bays = job[1]
         plan = self.plans[qc]
         while len(plan) <= config.LOAD_PREFETCH and self.env.now < v["deadline"] and not self.realloc_pending:
-            step = yield from self.plan_step(qc, v, bays)
+            step = yield from self.plan(qc, v, bays)
             if step is None:
                 break
             plan.append(step)
@@ -692,7 +819,7 @@ class Terminal:
         finally:
             self.loading[qc] = False
 
-    def load_step(self, qc: str, v: dict, step: dict, plan: deque):
+    def load_step(self, qc: str, v: dict, step: dict, plan: deque, dual: bool = False):
         # this AGV may come forward; so may the next one, unless it is bound for the same spur
         for s in (step, *[n for n in list(plan)[:1] if n["spur"] != step["spur"]]):
             if not s["turn"].triggered:
@@ -701,18 +828,13 @@ class Terminal:
         bay, row, tier, half = step["cell"]
         box = step["box"]["id"]
         yield from self.gantry(qc, step["spur"][0])
-        t0 = self.env.now
-        yield self.db(tx_load_vessel, box, v["id"], bay, row, tier, half)
-        cycle = self.rng.uniform(*config.QC_CYCLE)
+        task = yield from self.lift(qc, lambda t: self.db(tx_load_vessel, qc, box, v["id"], bay, row, tier, half, agv, t))
+        cycle = self.rng.uniform(*config.QC_CYCLE) * (config.DUAL_CYCLE_FACTOR if dual else 1.0)
         self.crane(qc, "QC", box, L.point(step["spur"], L.AGV_BED_Y), L.ship_cell(v["berth"], bay, row, tier, half),
                    L.QC_CLEAR_Y, cycle)
-        self.send("box", id=box, state="LOADING", carrier_id=None, vessel_id=v["id"],
-                  vessel_bay=bay, vessel_row=row, vessel_tier=tier, vessel_half=half)
         self.spawn(self.free_agv(agv))
         yield self.env.timeout(cycle)
-        yield self.db(tx_stow, qc, box, agv, {"vessel": v["id"], "bay": bay, "row": row, "tier": tier, "half": half},
-                      t0, self.env.now)
-        self.send("box", id=box, state="STOWED_ON_BOARD")
+        yield self.db(tx_stow, box, task, self.env.now)
         owner, pending = v["owner"][(bay, row)]
         v["owner"][(bay, row)] = (owner, pending - 1)
         v["loaded"] += 1
@@ -723,7 +845,6 @@ class Terminal:
         box, block = step["box"]["id"], step["box"]["block_code"]
         agv = None
         try:
-            self.send("box", id=box, state="RETRIEVING")
             agv = yield from self.claim_agv(L.block_spurs(block)[0])
             yield from self.travel(agv, "AGV", goals=near(L.block_spurs(block), self.at[agv][0]))
             yield from self.yard_to_agv(block, box, agv)
@@ -746,25 +867,32 @@ class Terminal:
 
     # quay: vessel calls ------------------------------------------------------------------------
     def berth(self, b: int):
-        yield self.env.timeout(config.FIRST_CALL_S[b])
+        span = config.BERTH_WINDOW_S[b]
+        first = config.FIRST_CALL_S[b]
+        wid = yield self.db(q.plan_window, b, "next call", first, first + span)
+        yield self.env.timeout(first)
         while True:
             while (yield self.db(q.yard_fill, "IMPORT")) > config.NEXT_VESSEL_YARD_MAX:
                 yield self.env.timeout(3)
             row = yield self.db(tx_berth, self.rng, b)
             now = self.env.now
+            yield self.db(q.window_alongside, wid, row["id"], row["name"], now)
+            nxt_t0 = now + span + config.VESSEL_SAIL_S + config.NEXT_VESSEL_GAP_S
+            nxt = yield self.db(q.plan_window, b, "next call", nxt_t0, nxt_t0 + span)
             v = {"id": row["id"], "name": row["name"], "imo": row["imo"], "berth": b,
                  "bays": row["bays"], "rows": row["rows"], "tiers": row["tiers"],
                  "status": "ARRIVING", "phase": None, "t0": now, "t1": now + config.VESSEL_SAIL_S,
                  "manifest": len(row["boxes"]), "left": len(row["boxes"]), "loaded": 0,
-                 "bay_left": Counter(x["vessel_bay"] for x in row["boxes"]),
+                 "bay_left": Counter(x["vessel_bay"] for x in row["boxes"]), "bay_busy": Counter(),
                  "height": {}, "top": {}, "kind": {}, "owner": {}, "closed": set(), "exhausted": set(),
-                 "deadline": 0.0, "phase_done": self.env.event()}
+                 "deadline": 0.0, "phase_done": self.env.event(), "window": (wid, now + span)}
             self.vessels[b] = v
             self.send("vessel", **self.vessel_view(v))
-            self.send("boxes", boxes=row["boxes"])
+            self.spawn(self.keep_window(v, nxt))
             yield self.env.timeout(config.VESSEL_SAIL_S)
 
-            v.update(status="BERTHED", phase="DISCHARGE")
+            # under dual cycling exports start going aboard during discharge: no load deadline yet
+            v.update(status="BERTHED", phase="DISCHARGE", deadline=math.inf)
             self.send("vessel", **self.vessel_view(v))
             self.reallocate()
             if v["left"]:
@@ -783,12 +911,32 @@ class Terminal:
             sailed = yield self.db(q.sail, v["id"])
             now = self.env.now
             v.update(status="DEPARTING", t0=now, t1=now + config.VESSEL_SAIL_S)
+            yield self.db(q.window_done, v["window"][0], now + config.VESSEL_SAIL_S)
+            wid = nxt
             self.send("vessel", **self.vessel_view(v))
             yield self.env.timeout(config.VESSEL_SAIL_S)
             self.send("vessel", **{**self.vessel_view(v), "status": "DEPARTED"})
             self.remove(*sailed)
             del self.vessels[b]
             yield self.env.timeout(config.NEXT_VESSEL_GAP_S)
+
+    def keep_window(self, v: dict, nxt: int):
+        """The berth plan follows reality: a call that runs over its window extends it. If that would
+        overlap the next call's window the database refuses, and the next call is pushed back first."""
+        step = config.WINDOW_STEP_S
+        while v["status"] not in ("DEPARTING", "DEPARTED"):
+            yield self.env.timeout(5)
+            wid, end = v["window"]
+            if v["status"] in ("DEPARTING", "DEPARTED") or self.env.now < end - 10:
+                continue
+            if not (yield self.db(q.move_window, wid, 0, step)):
+                x0, x1 = q.quay(v["berth"])
+                self.refused("berth_windows_no_overlap", ((x0 + x1) / 2, 0.5, -3.0),
+                             f"{v['name']} overruns into the next call at berth {v['berth']}")
+                yield self.db(q.move_window, nxt, step, step)
+                if not (yield self.db(q.move_window, wid, 0, step)):
+                    continue
+            v["window"] = (wid, end + step)
 
     # road ----------------------------------------------------------------------------------------
     def lorry_source(self, flow: str):
@@ -807,20 +955,17 @@ class Terminal:
         plate = "".join(self.rng.choices(string.ascii_uppercase, k=2)) + f"{self.rng.randint(10, 99)} " + \
                 "".join(self.rng.choices(string.ascii_uppercase, k=3))
         if flow == "IMPORT":
-            pick = yield self.db(q.pick_pickup, plate)
+            pick = yield self.db(q.pick_pickup, plate, lorry)
             if not pick:
                 return                                    # nothing booked for road in the yard
             box, block, gate, hold = pick["box"], pick["block_code"], pick["gate_id"], pick["customs_hold"]
             forty = None
-            self.send("box", id=box, state="RETRIEVING")
         else:
-            arrival = yield self.db(tx_export_arrival, self.rng, plate)
+            arrival = yield self.db(tx_export_arrival, self.rng, plate, lorry)
             if not arrival:
                 return                                    # export yard full: turned away at the gate
             box, block, gate, hold = arrival["id"], arrival["dest_block"], arrival["gate_id"], False
             forty = is_forty(arrival)
-            self.riding[box] = lorry
-            self.send("boxes", boxes=[{**arrival, "carrier_id": lorry}])
         thru = lambda x: (x, L.THRU_Z)  # noqa: E731
 
         # queue at the in-gate (west of it nothing else drives, so the queue is not booked)
@@ -835,6 +980,16 @@ class Terminal:
         tr = self.tracks[lorry]
         if abs(tr["path"][-1][0] - L.QUEUE_HEAD_X) > 0.01:
             yield self.env.timeout(max(0.0, tr["t1"] - self.env.now))
+        # check in at the booth: the database refuses while an outage covers this moment
+        while True:
+            try:
+                yield self.db(q.gate_checkin, gate)
+                break
+            except errors.CheckViolation as e:
+                if constraint_of(e) != "gate_closed":
+                    raise
+                self.refused("gate_closed", (L.GATE_IN_X, 0.5, L.THRU_Z), str(e).splitlines()[0])
+                yield self.env.timeout(2.0)
 
         bays = [b for b in range(1, config.BLOCK_BAYS + 1) if L.lorry_spot(block, b) not in self.spots_taken]
         spot = L.lorry_spot(block, bays[0] if bays else 1)
@@ -844,24 +999,27 @@ class Terminal:
         self.gate_queue.remove(lorry)
         self.queue_shift()
         yield from self.travel(lorry, "LORRY", cells=route, dwell={gate_i: (config.GATE_CHECKIN_S, None)})
-        yield self.db(q.gate_update, gate, status="AT_LANE")
 
         bed = (spot[0], L.LORRY_BED_Y, spot[1])
-        with self.rtg[block].request() as turn:
-            yield turn
-            t0 = self.env.now
-            if flow == "IMPORT":
-                target, moves = yield from self.dig_out(block, box)
-                yield self.db(tx_load_truck, target, gate, lorry, moves, t0, t0 + config.RTG_MOVE_S)
-                self.crane(f"RTG-{block}", "RTG", box, slot_point(target), bed, L.RTG_CLEAR_Y, config.RTG_MOVE_S)
-                self.riding[box] = lorry
-                self.send("box", id=box, state="ON_TRUCK", carrier_id=lorry)
-            else:
-                s = yield self.db(tx_drop_from_truck, box, forty, block, gate, lorry, t0, t0 + config.RTG_MOVE_S)
-                self.crane(f"RTG-{block}", "RTG", box, bed, slot_point(s), L.RTG_CLEAR_Y, config.RTG_MOVE_S)
-                self.riding.pop(box, None)
-                self.send("box", id=box, state="STACKED_IN_YARD", carrier_id=None, **s)
-            yield self.env.timeout(config.RTG_MOVE_S)
+        rtg = f"RTG-{block}"
+        while True:
+            with self.rtg[block].request() as turn:
+                yield turn
+                if flow == "IMPORT":
+                    target, moves = yield from self.dig_out(block, box)
+                    yield from self.lift(rtg, lambda t: self.db(tx_load_truck, target, gate, lorry, moves, t,
+                                                                t + config.RTG_MOVE_S))
+                    self.crane(rtg, "RTG", box, slot_point(target), bed, L.RTG_CLEAR_Y, config.RTG_MOVE_S)
+                    yield self.env.timeout(config.RTG_MOVE_S)
+                    break
+                s = yield from self.lift(rtg, lambda t: self.db(tx_drop_from_truck, box, forty, block, gate, lorry, t,
+                                                                t + config.RTG_MOVE_S))
+                if s:
+                    self.crane(rtg, "RTG", box, bed, slot_point(s), L.RTG_CLEAR_Y, config.RTG_MOVE_S)
+                    yield self.env.timeout(config.RTG_MOVE_S)
+                    break
+            self.waits["no_slot"] += 1
+            yield self.env.timeout(2.0)
 
         out = L.cells_along([spot, thru(spot[0]), thru(L.SCAN_ROAD_X), thru(L.GATE_OUT_X), thru(L.LORRY_EXIT_X)])
         stops = {out.index(thru(L.GATE_OUT_X)): (config.GATE_CHECKOUT_S + 0.3,
@@ -877,8 +1035,6 @@ class Terminal:
     def checkout(self, gate: int, box: str | None, lorry: str):
         yield self.env.timeout(config.GATE_CHECKOUT_S)
         yield self.db(tx_gate_out, box, gate)
-        if box:
-            self.send("box", id=box, state="GATE_OUT", carrier_id=lorry)
 
     # rail ----------------------------------------------------------------------------------------
     def trains(self):
@@ -891,7 +1047,6 @@ class Terminal:
             self.train = {"id": train, "unit": unit, "name": name, "status": "ARRIVING", "loaded": 0,
                           "unloaded": 0, "inbound": len(inbound), "capacity": capacity}
             self.send("train", **self.train)
-            self.send("boxes", boxes=inbound)
             rail = lambda x: (x, 0, L.RAIL_Z)  # noqa: E731
             yield from self.roll(unit, "TRAIN", [rail(L.TRAIN_FROM_X), rail(L.RAIL_X0)], duration=config.TRAIN_RUN_S)
 
@@ -965,11 +1120,10 @@ class Terminal:
         yield moving
         while not (block := (yield self.db(q.choose_block, box["hazmat"], "EXPORT"))):
             yield self.env.timeout(2)
-        t0 = self.env.now
-        task = yield self.db(tx_unload_wagon, rmg, box, agv, block, train, wagon, wagon_slot, t0, t0 + config.RMG_MOVE_S)
+        task = yield from self.lift(rmg, lambda t: self.db(tx_unload_wagon, rmg, box, agv, block, train, wagon, wagon_slot,
+                                                           t, t + config.RMG_MOVE_S))
         self.crane(rmg, "RMG", box["id"], L.wagon_slot_point(wagon, wagon_slot, is_forty(box)), L.point(spur, L.AGV_BED_Y),
                    L.RMG_CLEAR_Y, config.RMG_MOVE_S)
-        self.send("box", id=box["id"], state="IN_TRANSIT", carrier_id=agv)
         yield self.env.timeout(config.RMG_MOVE_S)
         self.train["unloaded"] += 1
         self.send("train", **self.train)
@@ -977,7 +1131,6 @@ class Terminal:
 
     def rail_load(self, rmg: str, train: int, pick: dict, wagon: int, wagon_slot: int):
         box, block = pick["id"], pick["block_code"]
-        self.send("box", id=box, state="RETRIEVING")
         agv = yield from self.claim_agv(L.block_spurs(block)[0])
         try:
             yield from self.rail_load_with(rmg, train, pick, wagon, wagon_slot, box, block, agv)
@@ -996,11 +1149,10 @@ class Terminal:
         else:
             yield from self.travel(agv, "AGV", goals=[spur])
         yield from self.gantry(rmg, spur[0])
-        t0 = self.env.now
-        yield self.db(tx_load_wagon, rmg, box, agv, train, wagon, wagon_slot, t0, t0 + config.RMG_MOVE_S)
+        yield from self.lift(rmg, lambda t: self.db(tx_load_wagon, rmg, box, agv, train, wagon, wagon_slot,
+                                                    t, t + config.RMG_MOVE_S))
         self.crane(rmg, "RMG", box, L.point(spur, L.AGV_BED_Y), L.wagon_slot_point(wagon, wagon_slot, is_forty(pick)),
                    L.RMG_CLEAR_Y, config.RMG_MOVE_S)
-        self.send("box", id=box, state="ON_RAIL", carrier_id=None, train_id=train, wagon=wagon, wagon_slot=wagon_slot)
         yield self.env.timeout(config.RMG_MOVE_S)
         self.train["loaded"] += 2 if is_forty(pick) else 1
         self.send("train", **self.train)
@@ -1009,3 +1161,73 @@ class Terminal:
         while True:
             yield self.env.timeout(config.BOOK_PRUNE_EVERY_S)
             yield self.db(q.prune_bookings, self.env.now - 5)
+
+    # weather + chaos -----------------------------------------------------------------------------
+    def weather(self):
+        """Wind that wanders, a storm front every few minutes, fog around dawn. Each reading is a row:
+        the lift trigger reads the latest one, so the database decides when cranes stop."""
+        wind, storm = self.weather_now["wind"], None
+        next_storm = config.FIRST_STORM_S
+        while True:
+            now = self.env.now
+            if self.force_storm or (storm is None and now >= next_storm):
+                self.force_storm = False
+                length = self.rng.uniform(80, 120)
+                storm = (now, now + length, self.rng.uniform(24, 29))
+                next_storm = now + length + self.rng.uniform(*config.STORM_GAP_S)
+                self.send("chaos", what="storm", detail=f"storm front: wind building to {storm[2]:.0f} m/s")
+            gale = 0.0
+            if storm:
+                t0, t1, _ = storm
+                gale = math.sin(math.pi * (now - t0) / (t1 - t0)) ** 0.7 if now < t1 else 0.0
+                if now >= t1:
+                    storm = None
+            base = 6.5 + 2.5 * math.sin(now / 97.0)
+            target = base + (storm[2] - base) * gale if storm else base
+            wind = max(0.5, wind + (target - wind) * 0.45 + self.rng.gauss(0, 0.5))
+            hour = (config.DAY_START_H + 24 * now / config.DAY_S) % 24
+            fog = 0.25 * gale if storm else max(0.0, 0.65 - abs(hour - 6.5) * 0.4)
+            w = {"wind": round(wind, 1), "gust": round(wind * self.rng.uniform(1.15, 1.4), 1),
+                 "rain": round(min(1.0, gale * 1.3), 2), "fog": round(min(1.0, fog), 2)}
+            yield self.db(q.add_weather, now, w["wind"], w["gust"], w["rain"], w["fog"])
+            self.weather_now = w
+            self.send("weather", **w)
+            yield self.env.timeout(config.WEATHER_EVERY_S)
+
+    def chaos_loop(self):
+        while True:
+            yield self.env.timeout(self.rng.uniform(*config.CHAOS_GAP_S))
+            if self.chaos_auto:
+                self.spawn(self.chaos(self.rng.choice(["crane", "agv", "gate"])))
+
+    def chaos(self, kind: str):
+        """Something breaks. The database is told; its rules then keep work away until it is fixed."""
+        now = self.env.now
+        if kind == "storm":
+            self.force_storm = True
+        elif kind == "gate":
+            if (yield self.db(q.gate_outage, now, now + config.GATE_OUTAGE_S, "barrier fault")):
+                self.send("chaos", what="gate", detail=f"in-gate barrier fault, closed for {config.GATE_OUTAGE_S:.0f} s")
+        elif kind == "crane":
+            up = [qc for qc in QCS if qc not in self.down]
+            unit = self.rng.choice([qc for qc in up if self.assign.get(qc)] or up)
+            yield self.db(q.set_equipment_state, unit, "DOWN")
+            self.down.add(unit)
+            self.send("chaos", what="crane", unit=unit, detail=f"{unit} hoist fault, out of service")
+            yield self.env.timeout(config.REPAIR_S["crane"])
+            yield self.db(q.set_equipment_state, unit, "IDLE")
+            self.down.discard(unit)
+            self.send("chaos", what="repaired", unit=unit, detail=f"{unit} repaired")
+        elif kind == "agv":
+            yield self.agv_gate.get(1)
+            unit = yield self.db(q.agv_fault)
+            if not unit:
+                yield self.agv_gate.put(1)
+                return
+            self.down.add(unit)
+            self.send("chaos", what="agv", unit=unit, detail=f"{unit} drive fault, out of service")
+            yield self.env.timeout(config.REPAIR_S["agv"])
+            yield self.db(q.release_equipment, unit)
+            self.down.discard(unit)
+            self.send("chaos", what="repaired", unit=unit, detail=f"{unit} repaired")
+            yield self.agv_gate.put(1)

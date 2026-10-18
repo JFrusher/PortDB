@@ -145,3 +145,60 @@ pre { font: 10.5px/1.45 var(--mono); background: var(--surface); border: 1px sol
 .log .export { color: #3f6f8f; }
 .dispatch { max-height: calc(100% - 32px); }
 .log { width: 440px; }
+
+/* --- time travel, X-ray, ops tabs --- */
+.dispatch { width: 336px; }
+.tabs { display: flex; gap: 4px; margin: 12px 0 4px; flex-wrap: wrap; }
+.tabs button { padding: 4px 8px; font-size: 11px; text-transform: capitalize; }
+.replay-badge { color: #fff; background: #6c5ce7; border-radius: 6px; padding: 2px 6px; font-weight: 600; }
+.weather { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11.5px; }
+.gauge { position: relative; flex: 1; height: 8px; background: #efeae0; border-radius: 4px; }
+.gauge i { position: absolute; inset: 0 auto 0 0; background: #8ecae6; border-radius: 4px; transition: width 0.6s; }
+.gauge i.over { background: var(--danger); }
+.gauge b { position: absolute; top: -3px; width: 2px; height: 14px; background: var(--ink); }
+.seg { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 4px; }
+.seg button { font-size: 11px; padding: 5px 8px; }
+.kpi { width: 100%; height: 90px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+.refusal-row { display: grid; grid-template-columns: minmax(0, 1fr) 56px 32px; gap: 8px; align-items: center; font-size: 11px; margin-bottom: 3px; }
+.refusal-row span:last-child { text-align: right; }
+.statements { list-style: none; padding: 0; margin: 0; font-size: 10.5px; }
+.statements li { display: grid; padding: 4px 0; border-bottom: 1px solid var(--border); }
+.statements span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gantt { display: grid; gap: 6px; }
+.gantt .lane { display: grid; grid-template-columns: 24px 1fr; gap: 6px; align-items: center; font-size: 11px; }
+.gantt .track { position: relative; height: 22px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.gantt .win { position: absolute; top: 2px; bottom: 2px; border-radius: 4px; font: 600 10px var(--sans); color: #fff; padding: 2px 4px; overflow: hidden; white-space: nowrap; }
+.gantt .win.planned { background: #a3b1c6; }
+.gantt .win.alongside { background: var(--success); }
+.gantt .win.done { background: #c9c4ba; }
+.gantt .now { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--danger); }
+.chaos-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px; }
+.journey { list-style: none; padding: 0; margin: 0; font-size: 11.5px; border-left: 2px solid var(--warning); }
+.journey li { padding: 3px 8px; cursor: pointer; }
+.journey li:hover { background: #fdf3e9; }
+
+.controls .timebar { display: flex; align-items: center; gap: 8px; width: 560px; font-size: 11px; }
+.timebar input { flex: 1; accent-color: #6c5ce7; }
+.timebar button.live.on { background: var(--danger); border-color: #b85a43; }
+.controls .views { align-items: center; gap: 8px; font-size: 11px; }
+.views label { display: flex; align-items: center; gap: 4px; color: var(--dim); }
+.views select { font: 600 11px var(--sans); color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 4px; }
+button:disabled { opacity: 0.4; cursor: default; }
+
+.xray-tag, .refusal-tag, .heat-tag, .unit-alert, .xray-legend {
+  font: 600 9.5px var(--mono); white-space: nowrap; pointer-events: none; border-radius: 6px; padding: 2px 6px;
+}
+.xray-tag { background: rgba(255, 255, 255, 0.85); color: #3f6f8f; border: 1px solid #a9c7da; }
+.xray-tag.down { color: #9c4a33; border-color: var(--danger); }
+.refusal-tag { background: var(--danger); color: #fff; box-shadow: 0 2px 6px rgba(224, 80, 58, 0.4); }
+.heat-tag { background: var(--card); color: #2b4a6f; border: 1px solid #a9c0da; }
+.unit-alert { color: #fff; }
+.unit-alert.down { background: var(--danger); }
+.unit-alert.held { background: #3f6f8f; }
+.xray-legend { background: rgba(43, 45, 66, 0.9); color: #f4f1ea; white-space: normal; width: 560px; line-height: 1.5; pointer-events: none; }
+.xray-tag[hidden], .refusal-tag[hidden], .heat-tag[hidden], .unit-alert[hidden], .xray-legend[hidden] { display: none; }
+.refusal-row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dispatch { overflow-x: hidden; }
+.stale { opacity: 0.4; }
+.controls .xray-legend { display: block; font-family: var(--sans); font-weight: 500; font-size: 11px; }

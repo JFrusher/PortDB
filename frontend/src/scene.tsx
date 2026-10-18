@@ -4,9 +4,11 @@ import { EffectComposer, N8AO, TiltShift2, Vignette } from "@react-three/postpro
 import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
-import { Agv, C, Gantry, GateHouse, Lorry, People, QuayCrane, Scanner, Ships, Train, setView, useDetail, useQuality, view } from "./models";
+import { Agv, C, Gantry, GateHouse, Lorry, People, QuayCrane, Scanner, Ships, TUG, Train, setView, useDetail, useQuality, view } from "./models";
+import { HeatPads, Journey, UnitAlerts, XRay } from "./overlays";
 import { MAT, Parts } from "./parts";
-import { boxPos, simNow, useWorldSelect, world, type Focus, type Layout, type V3 } from "./world";
+import { Sky } from "./sky";
+import { boxPos, simNow, useWorldSelect, world, type Box, type Focus, type Layout, type V3 } from "./world";
 
 // quality: ?q=0 flat, ?q=1 shadows, ?q=2 shadows + tilt-shift/AO. Without ?q it adapts to the frame rate.
 const params = new URLSearchParams(location.search);
@@ -72,11 +74,12 @@ function Water() {
   const base = useMemo(() => Float32Array.from(geo.attributes.position.array), [geo]);
   useFrame(() => {
     const t = simNow();
+    const chop = 0.6 + world.weather.wind / 12;          // a gale whips the harbour up
     const pos = geo.attributes.position as THREE.BufferAttribute;
     for (let i = 0; i < pos.count; i++) {
       const x = base[i * 3];
       const y = base[i * 3 + 1];
-      pos.setZ(i, Math.sin(x * 0.55 + t * 1.1) * 0.045 + Math.cos(y * 0.9 + x * 0.2 + t * 0.8) * 0.035);
+      pos.setZ(i, (Math.sin(x * 0.55 + t * 1.1 * chop) * 0.045 + Math.cos(y * 0.9 + x * 0.2 + t * 0.8 * chop) * 0.035) * chop);
     }
     pos.needsUpdate = true;
     geo.computeVertexNormals();
@@ -265,10 +268,6 @@ function Scenery({ L }: { L: Layout }) {
 
 function Tug() {
   const ref = useRef<THREE.Group>(null!);
-  const geo = useMemo(
-    () => new Parts().box([1.4, 0.35, 0.6], [0, 0.1, 0], C.boot).box([0.6, 0.4, 0.45], [-0.15, 0.45, 0], C.ivory).cyl(0.07, 0.3, [-0.35, 0.8, 0], C.steel).build(),
-    [],
-  );
   useFrame(() => {
     const t = simNow();
     ref.current.position.set(48 + Math.sin(t * 0.12) * 6, -0.12 + Math.sin(t * 1.3) * 0.04, -12 + Math.cos(t * 0.12) * 2);
@@ -276,7 +275,7 @@ function Tug() {
   });
   return (
     <group ref={ref}>
-      <mesh geometry={geo} material={MAT} castShadow />
+      <mesh geometry={TUG} material={MAT} castShadow />
     </group>
   );
 }
@@ -296,34 +295,104 @@ function hashPick<T>(id: string, xs: T[]): T {
   return xs[Math.abs(h) % xs.length];
 }
 
-/** Corrugated side panels with a darker frame, multiplied by each instance's colour. */
-function ribTexture() {
+// Shipping-line liveries: one 4x4 texture atlas, a tile index per instance. Tile 8 is plain ribbed
+// steel, tinted per instance when the boxes are coloured by data instead of by owner.
+const LINES: [string, string, string][] = [
+  ["MSC", "#EFE6D2", "#3D405B"], ["MAE", "#7FB7D6", "#FFFFFF"], ["CMA", "#4F6D9A", "#FFFFFF"], ["HLX", "#E9A25F", "#FFFFFF"],
+  ["ONE", "#D987A6", "#FFFFFF"], ["EGL", "#6BA37E", "#FFFFFF"], ["COS", "#F4F4F2", "#4F6D9A"], ["OOL", "#9A8FC4", "#FFFFFF"],
+];
+const PLAIN = 8;
+const LINE_TILE = Object.fromEntries(LINES.map(([code], i) => [code, i]));
+
+function liveryAtlas() {
+  const W = 128;
+  const H = 64;
   const c = document.createElement("canvas");
-  c.width = 128;
-  c.height = 64;
+  c.width = W * 4;
+  c.height = H * 4;
   const g = c.getContext("2d")!;
-  g.fillStyle = "#ffffff";
-  g.fillRect(0, 0, 128, 64);
-  g.fillStyle = "rgba(0,0,0,0.12)";
-  for (let x = 6; x < 122; x += 7) g.fillRect(x, 5, 3, 54);
-  g.fillStyle = "rgba(0,0,0,0.22)";
-  g.fillRect(0, 0, 128, 5);
-  g.fillRect(0, 59, 128, 5);
-  g.fillRect(0, 0, 5, 64);
-  g.fillRect(123, 0, 5, 64);
+  const tile = (k: number, fill: string, ink: string | null, code: string) => {
+    const x = (k % 4) * W;
+    const y = c.height - (Math.floor(k / 4) + 1) * H;
+    g.fillStyle = fill;
+    g.fillRect(x, y, W, H);
+    g.fillStyle = "rgba(0,0,0,0.12)";
+    for (let rx = 6; rx < W - 6; rx += 7) g.fillRect(x + rx, y + 5, 3, H - 10);
+    g.fillStyle = "rgba(0,0,0,0.22)";
+    g.fillRect(x, y, W, 5);
+    g.fillRect(x, y + H - 5, W, 5);
+    g.fillRect(x, y, 5, H);
+    g.fillRect(x + W - 5, y, 5, H);
+    if (ink) {
+      g.fillStyle = ink;
+      g.font = "800 30px 'Plus Jakarta Sans', system-ui, sans-serif";
+      g.textAlign = "center";
+      g.textBaseline = "middle";
+      g.fillText(code, x + W / 2, y + H / 2 + 2);
+    }
+  };
+  LINES.forEach(([code, fill, ink], k) => tile(k, fill, ink, code));
+  tile(PLAIN, "#FFFFFF", null, "");
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
+  t.generateMipmaps = false;                 // mipmaps would bleed neighbouring tiles at the edges
+  t.minFilter = THREE.LinearFilter;
   t.anisotropy = 4;
   return t;
+}
+
+function boxMaterial(map: THREE.Texture) {
+  const mat = new THREE.MeshStandardMaterial({ map, roughness: 0.65 });
+  mat.onBeforeCompile = (sh) => {
+    sh.vertexShader = sh.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute float aTile;")
+      .replace(
+        "#include <uv_vertex>",
+        "#include <uv_vertex>\n#ifdef USE_MAP\n vMapUv = (vMapUv * 0.94 + 0.03 + vec2(mod(aTile, 4.0), floor(aTile / 4.0))) * 0.25;\n#endif",
+      );
+  };
+  return mat;
+}
+
+const mix = (a: string, b: string, u: number) => tmpC.set(a).lerp(tmpC2.set(b), Math.max(0, Math.min(1, u)));
+const tmpC2 = new THREE.Color();
+const WHITE = "#FFFFFF";
+
+/** Tile and tint for one box under the current colour mode. */
+function look(b: Box, selected: string | null, now: number): [number, THREE.Color] {
+  if (b.id === selected) return [PLAIN, tmpC.set(C.selected)];
+  if (world.visible && !world.visible.has(b.id)) return [PLAIN, tmpC.set("#DCD9D2")];   // hidden from this role
+  if (b.state === "RETRIEVING") return [PLAIN, tmpC.set(C.retrieving)];
+  switch (world.colorBy) {
+    case "port":
+      return [PLAIN, tmpC.set(b.hazmat ? C.hazmat : b.pod ? C.pod[b.pod] : b.iso_type.endsWith("R1") ? C.reefer : hashPick(b.id, C.dry))];
+    case "weight":
+      return [PLAIN, mix("#EAF2F3", "#2B4A6F", (b.weight_kg - 2000) / 30500)];
+    case "dwell":
+      return b.yard_in_t != null ? [PLAIN, mix("#9BD3AE", "#C8553D", (now - b.yard_in_t) / 360)] : [PLAIN, tmpC.set("#D6D6D6")];
+    case "rehandles":
+      return [PLAIN, tmpC.set(!b.rehandles ? "#D5D8DE" : b.rehandles === 1 ? "#F4A261" : "#C8553D")];
+    case "reefer":
+      return [PLAIN, tmpC.set(b.iso_type.endsWith("R1") ? "#3F88C5" : "#E4E4E4")];
+    default:
+      if (b.hazmat) return [PLAIN, tmpC.set(C.hazmat)];
+      return [LINE_TILE[b.id.slice(0, 3)] ?? PLAIN, tmpC.set(WHITE)];
+  }
 }
 
 function Containers({ L, selected, onPick }: { L: Layout; selected: string | null; onPick: (id: string) => void }) {
   const mesh = useRef<THREE.InstancedMesh>(null!);
   const order = useRef<string[]>([]);
-  const map = useMemo(ribTexture, []);
+  const material = useMemo(() => boxMaterial(liveryAtlas()), []);
+  const geo = useMemo(() => {
+    const g = new THREE.BoxGeometry();
+    g.setAttribute("aTile", new THREE.InstancedBufferAttribute(new Float32Array(MAX_BOXES), 1));
+    return g;
+  }, []);
   useFrame(() => {
     const now = simNow();
     const m = mesh.current;
+    const tiles = geo.attributes.aTile as THREE.InstancedBufferAttribute;
     let n = 0;
     order.current.length = 0;
     for (const b of world.boxes.values()) {
@@ -333,33 +402,31 @@ function Containers({ L, selected, onPick }: { L: Layout; selected: string | nul
       // real proportions: 40 ft is ~2.5x its width, 20 ft half that, so both read as lying along the quay
       tmpS.set(forty ? 0.94 : 0.46, L.box_h * 0.92, 0.36);
       m.setMatrixAt(n, tmpM.compose(tmpP, tmpQ, tmpS));
-      // exports wear the colour of their port of discharge, so the stowage rule shows on deck
-      const color =
-        b.id === selected ? C.selected
-        : b.state === "RETRIEVING" ? C.retrieving
-        : b.hazmat ? C.hazmat
-        : b.pod ? C.pod[b.pod]
-        : b.iso_type.endsWith("R1") ? C.reefer
-        : hashPick(b.id, C.dry);
-      m.setColorAt(n, tmpC.set(color));
+      const [tile, color] = look(b, selected, now);
+      tiles.setX(n, tile);
+      m.setColorAt(n, color);
       order.current.push(b.id);
       n++;
     }
     m.count = n;
     m.instanceMatrix.needsUpdate = true;
+    tiles.needsUpdate = true;
     if (m.instanceColor) m.instanceColor.needsUpdate = true;
     m.computeBoundingSphere();
+    // X-ray: the stacks go glassy so the bookings and envelopes underneath show through
+    const xray = world.xray && world.mode === "live";
+    if (material.transparent !== xray) {
+      material.transparent = xray;
+      material.depthWrite = !xray;
+      material.needsUpdate = true;
+    }
+    material.opacity = xray ? 0.25 : 1;
   });
   const click = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
     if (e.instanceId != null) onPick(order.current[e.instanceId]);
   };
-  return (
-    <instancedMesh ref={mesh} args={[undefined, undefined, MAX_BOXES]} castShadow receiveShadow onClick={click}>
-      <boxGeometry />
-      <meshStandardMaterial map={map} roughness={0.65} />
-    </instancedMesh>
-  );
+  return <instancedMesh ref={mesh} args={[geo, material, MAX_BOXES]} castShadow receiveShadow onClick={click} />;
 }
 
 function Lorries() {
@@ -386,7 +453,7 @@ function Badges({ L }: { L: Layout }) {
         return (
           <Html key={b.code} position={[b.x0 + (b.bays + 1) / 2, L.rtg_clear_y + 1.5, b.z0 + (b.rows + 1) / 2]} center zIndexRange={[20, 0]}>
             <div className="badge-rehandle" hidden={!r}>
-              RE-RECYCLE IN PROGRESS
+              RE-HANDLE IN PROGRESS
               {r && (
                 <span>
                   {r.moves} shift{r.moves > 1 ? "s" : ""} over {r.target}
@@ -396,36 +463,6 @@ function Badges({ L }: { L: Layout }) {
           </Html>
         );
       })}
-    </>
-  );
-}
-
-function Lights() {
-  const quality = useQuality();
-  const target = useMemo(() => {
-    const o = new THREE.Object3D();
-    o.position.set(26, 0, 4);
-    return o;
-  }, []);
-  return (
-    <>
-      <hemisphereLight args={["#FFF4E6", "#C9D6DF", 1.15]} />
-      <primitive object={target} />
-      <directionalLight
-        target={target}
-        position={[4, 34, 26]}
-        intensity={2.3}
-        color="#FFE1C2"
-        castShadow={quality >= 1}
-        shadow-mapSize={[2048, 2048]}
-        shadow-camera-left={-70}
-        shadow-camera-right={70}
-        shadow-camera-top={34}
-        shadow-camera-bottom={-34}
-        shadow-camera-near={1}
-        shadow-camera-far={140}
-        shadow-bias={-0.0004}
-      />
     </>
   );
 }
@@ -514,7 +551,7 @@ export function Diorama({ selected, onPick }: { selected: string | null; onPick:
       <color attach="background" args={[C.table]} />
       <Quality />
       <Rig />
-      <Lights />
+      <Sky L={L} />
       <Terrain L={L} />
       <Scenery L={L} />
       <Ships L={L} />
@@ -531,6 +568,10 @@ export function Diorama({ selected, onPick }: { selected: string | null; onPick:
       )}
       <Lorries />
       <Badges L={L} />
+      <XRay L={L} />
+      <Journey />
+      <HeatPads L={L} />
+      <UnitAlerts L={L} />
       <CloseUp L={L} />
       <Effects />
     </Canvas>

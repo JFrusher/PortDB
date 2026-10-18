@@ -197,6 +197,7 @@ def rmg_homes() -> list[float]:
 def payload() -> dict:
     return {
         "box_h": BOX_H, "ship_deck": SHIP_DECK, "teu": TEU,
+        "day": {"length_s": config.DAY_S, "start_h": config.DAY_START_H},
         "agv_bed_y": AGV_BED_Y, "lorry_bed_y": LORRY_BED_Y, "wagon_bed_y": WAGON_BED_Y,
         "berths": [{"id": b, "name": name, "x0": BERTH_X0[b], "bays": bays, "rows": rows, "tiers": tiers}
                    for b, (name, bays, rows, tiers, _) in config.BERTHS.items()],
