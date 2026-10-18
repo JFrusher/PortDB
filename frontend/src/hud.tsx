@@ -408,8 +408,8 @@ function TimeBar() {
   const t = drag ?? (replaying ? simNow() : live);
   return (
     <div className="timebar mono">
-      <button className={replaying ? "" : "on live"} onClick={() => replaying && goLive()} title="Back to the live terminal">
-        ● LIVE
+      <button className={replaying ? "" : "on live"} onClick={() => replaying && goLive()}>
+        LIVE
       </button>
       <input
         type="range"

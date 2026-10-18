@@ -150,7 +150,7 @@ pre { font: 10.5px/1.45 var(--mono); background: var(--surface); border: 1px sol
 .dispatch { width: 336px; }
 .tabs { display: flex; gap: 4px; margin: 12px 0 4px; flex-wrap: wrap; }
 .tabs button { padding: 4px 8px; font-size: 11px; text-transform: capitalize; }
-.replay-badge { color: #fff; background: #6c5ce7; border-radius: 6px; padding: 2px 6px; font-weight: 600; }
+.replay-badge { color: #fff; background: var(--asphalt); border-radius: 6px; padding: 2px 6px; font-weight: 600; }
 .weather { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11.5px; }
 .gauge { position: relative; flex: 1; height: 8px; background: #efeae0; border-radius: 4px; }
 .gauge i { position: absolute; inset: 0 auto 0 0; background: #8ecae6; border-radius: 4px; transition: width 0.6s; }
@@ -179,7 +179,7 @@ pre { font: 10.5px/1.45 var(--mono); background: var(--surface); border: 1px sol
 .journey li:hover { background: #fdf3e9; }
 
 .controls .timebar { display: flex; align-items: center; gap: 8px; width: 560px; font-size: 11px; }
-.timebar input { flex: 1; accent-color: #6c5ce7; }
+.timebar input { flex: 1; accent-color: var(--warning); }
 .timebar button.live.on { background: var(--danger); border-color: #b85a43; }
 .controls .views { align-items: center; gap: 8px; font-size: 11px; }
 .views label { display: flex; align-items: center; gap: 4px; color: var(--dim); }
