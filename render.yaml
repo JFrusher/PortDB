@@ -1,10 +1,6 @@
-# Render blueprint: a live demo from this repo. New > Blueprint, point it at the repository.
-# The free tiers sleep when idle; the API resets the terminal on every boot, so a visit starts a fresh shift.
-databases:
-  - name: portdb-db
-    plan: free
-    postgresMajorVersion: "16"
-
+# Render blueprint: the API and the diorama. The database is Supabase (see README, "Deploy your own").
+# New > Blueprint, point it at the repository; Render asks for DATABASE_URL on first apply.
+# The free tier sleeps when idle; the API resets the terminal on every boot, so a visit starts a fresh shift.
 services:
   - type: web
     name: portdb-api
@@ -13,10 +9,10 @@ services:
     plan: free
     healthCheckPath: /api/layout
     envVars:
+      # Supabase > Connect > Session pooler (port 5432). Not the transaction pooler on 6543: the change
+      # feed needs a LISTEN session and every transaction sets portdb.sim_t.
       - key: DATABASE_URL
-        fromDatabase:
-          name: portdb-db
-          property: connectionString
+        sync: false
 
   - type: web
     name: portdb

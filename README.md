@@ -202,7 +202,12 @@ npm run dev                      # :5173, proxies /api and /ws to :8000
 
 The API resets the terminal on every start, because a half-finished simulation can't be resumed.
 
-**Deploy your own:** [`render.yaml`](render.yaml) is a Render blueprint (Postgres, API, web). On a managed Postgres without `CREATEROLE` the row-level security roles are skipped with a notice and everything else works.
+**Deploy your own** on Supabase (Postgres) and Render (API and diorama):
+
+1. Create a Supabase project. From **Connect**, copy the **Session pooler** string (port 5432) and put the database password in it. The transaction pooler (6543) won't do: the change feed holds a `LISTEN` session and every transaction sets `portdb.sim_t`.
+2. On Render, **New → Blueprint** on this repo. [`render.yaml`](render.yaml) creates both services and asks for `DATABASE_URL`: paste the string. The API runs the migrations on boot.
+
+On a Postgres without `CREATEROLE` the row-level security roles are skipped with a notice and everything else works.
 
 ## Tests and CI
 
