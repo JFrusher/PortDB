@@ -24,8 +24,7 @@ services:
         value: "80"
       - key: API_SCHEME
         value: https
+      # the API's public host, e.g. portdb-api-xxxx.onrender.com (no https://). Free instances have no
+      # private network, so the internal name a fromService reference gives cannot be resolved
       - key: API_HOST
-        fromService:
-          name: portdb-api
-          type: web
-          property: host
+        sync: false
